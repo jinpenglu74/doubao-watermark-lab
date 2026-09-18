@@ -1176,9 +1176,15 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     const launchQc = (targetPath) => {
       const started = Date.now();
       qcTargetPath = targetPath;
-      return runQcCheck(sourcePath, targetPath)
-        .then((qc) => ({ qc, error: null, elapsedMs: Date.now() - started }))
-        .catch((error) => ({ qc: null, error, elapsedMs: Date.now() - started }));
+      // 延后一拍启动，让网络型残留复检先进入 await；QC 的本地 CPU 工作随后利用等待时间完成，
+      // 避免在开始复检前先同步卡住主进程。
+      return new Promise((resolve) => {
+        setImmediate(() => {
+          runQcCheck(sourcePath, targetPath)
+            .then((qc) => resolve({ qc, error: null, elapsedMs: Date.now() - started }))
+            .catch((error) => resolve({ qc: null, error, elapsedMs: Date.now() - started }));
+        });
+      });
     };
     try {
       const promptText = runtime.prompt || buildPrompt(settings);
