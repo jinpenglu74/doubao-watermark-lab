@@ -1161,10 +1161,30 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     if (taskConversationId && inUseConversations.has(taskConversationId)) taskConversationId = '';
     if (taskConversationId) inUseConversations.add(taskConversationId);
     let paddedUpload = null;
+    const taskStartedAt = Date.now();
+    const timings = {
+      firstPassMs: 0,
+      fallbackPassMs: 0,
+      downloadSaveMs: 0,
+      auditMs: 0,
+      repairMs: 0,
+      qcMs: 0,
+      totalMs: 0
+    };
+    let qcPromise = null;
+    let qcTargetPath = '';
+    const launchQc = (targetPath) => {
+      const started = Date.now();
+      qcTargetPath = targetPath;
+      return runQcCheck(sourcePath, targetPath)
+        .then((qc) => ({ qc, error: null, elapsedMs: Date.now() - started }))
+        .catch((error) => ({ qc: null, error, elapsedMs: Date.now() - started }));
+    };
     try {
       const promptText = runtime.prompt || buildPrompt(settings);
       // 第一轮：原图直发（不加隔离带、不做任何加工），尝试从接口拦截无水印原图；
       // 命中即不裁切直接导出
+      const firstPassStarted = Date.now();
       const firstPass = await automation.processImage({
         filePath: file.path,
         prompt: promptText,
@@ -1174,6 +1194,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         conversationId: taskConversationId,
         imageWaitSeconds: settings.imageWaitSeconds
       });
+      timings.firstPassMs += Date.now() - firstPassStarted;
       let candidates = firstPass.candidates;
       let conversationId = firstPass.conversationId;
       let uploadPath = file.path;
@@ -1195,6 +1216,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           edge: settings.cropEdge
         });
         uploadPath = paddedUpload.path;
+        const fallbackPassStarted = Date.now();
         const secondPass = await automation.processImage({
           filePath: uploadPath,
           prompt: promptText,
@@ -1202,9 +1224,11 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           conversationId: conversationId || taskConversationId,
           imageWaitSeconds: settings.imageWaitSeconds
         });
+        timings.fallbackPassMs += Date.now() - fallbackPassStarted;
         candidates = secondPass.candidates;
         conversationId = secondPass.conversationId || conversationId;
       }
+      const downloadSaveStarted = Date.now();
       let candidate;
       try {
         candidate = await downloadBestImage({
@@ -1254,6 +1278,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         settings,
         paddedUpload
       });
+      timings.downloadSaveMs += Date.now() - downloadSaveStarted;
+
+      // 本地像素 QC 与豆包残留复检并行。正常结果只做快速像素比较，不再生成热力图。
+      qcPromise = launchQc(saved.path);
 
       // 通用残留水印闭环：不依赖固定位置、颜色、语言或某一种 Logo。
       // 先让视觉模型全图复检并返回归一化区域；只对高置信区域自动打粉色遮罩做定点补修，
@@ -1272,11 +1300,13 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               ...jobBase,
               message: `正在全图复检残留水印（${residualAuditCount}/${maxAutoRepairPasses + 1}）`
             });
+            const auditStarted = Date.now();
             audit = await automation.inspectWatermarkResidual({
               filePath: saved.path,
               prompt: buildWatermarkAuditPrompt(settings),
               timeoutMs: 90_000
             });
+            timings.auditMs += Date.now() - auditStarted;
           } catch (auditError) {
             if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(auditError.code) || isDestroyedObjectError(auditError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
@@ -1296,15 +1326,20 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             break;
           }
 
+          // 第一轮允许 0.62 以上的高置信残留自动补修；第一轮补修后，
+          // 第二轮只处理 >=0.82 的明确残留，避免为了低置信疑点再跑一整轮豆包生成。
+          const minRepairConfidence = autoRepairPasses > 0 ? 0.82 : 0.62;
           const repairRegions = (Array.isArray(audit.regions) ? audit.regions : [])
-            .filter((region) => Number(region.confidence) >= 0.62)
+            .filter((region) => Number(region.confidence) >= minRepairConfidence)
             .slice(0, 48);
           if (!repairRegions.length) {
             residualStatus = 'review';
             batchEvent({
               type: 'job-progress',
               ...jobBase,
-              message: '检测到低置信度疑似标记，为避免误删真实场景文字，已保留当前结果供人工确认'
+              message: autoRepairPasses > 0
+                ? '第一轮补修后仅剩低置信度疑似残留，已停止继续生成并保留结果供人工确认'
+                : '检测到低置信度疑似标记，为避免误删真实场景文字，已保留当前结果供人工确认'
             });
             break;
           }
@@ -1326,6 +1361,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
 
           let markedUpload = null;
           let repairPadding = null;
+          const repairStarted = Date.now();
           try {
             batchEvent({
               type: 'job-progress',
@@ -1418,6 +1454,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             saved = repaired;
             autoRepairPasses += 1;
             residualStatus = 'repaired-pending-audit';
+            // 初始结果的并行 QC 已经过期，最终只需要对最新补修结果再做一次。
+            qcPromise = null;
+            qcTargetPath = '';
           } catch (repairError) {
             if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(repairError.code) || isDestroyedObjectError(repairError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
@@ -1431,6 +1470,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             });
             break;
           } finally {
+            timings.repairMs += Date.now() - repairStarted;
             if (markedUpload?.directory) {
               await fs.rm(markedUpload.directory, { recursive: true, force: true }).catch(() => {});
             }
