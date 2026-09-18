@@ -719,36 +719,46 @@ async function broadcastLoginStatus() {
   if (loginFlowActive && status.loggedIn) {
     loginFlowActive = false;
     const persistentSession = session.fromPartition(DOUBAO_PARTITION);
-    persistentSession.flushStorageData();
+    try { persistentSession.flushStorageData(); } catch { /* 忽略持久化瞬时错误 */ }
     clearInterval(loginTimer);
     loginTimer = null;
-    // 只收掉空闲的豆包窗口；正被批次占用（busy）的窗口不能销毁，否则并发中的任务会被打断
+    // 批处理运行期间绝不销毁任何豆包窗口。旧逻辑虽然跳过 busy 窗口，
+    // 但窗口池/登录恢复切换存在极短竞态，可能把仍被异步链持有的 webContents 销毁，
+    // 最终冒出 "Object has been destroyed"。运行中只隐藏空闲窗口，批次结束后再复用/回收。
     for (const window of BrowserWindow.getAllWindows()) {
-      if (window !== mainWindow && !window.isDestroyed()
-        && window.webContents.session === persistentSession && !busyWindows.has(window)) {
+      if (window === mainWindow || !windowUsesDoubaoSession(window, persistentSession) || busyWindows.has(window)) continue;
+      try {
         window.hide();
-        window.destroy();
-      }
+        if (activeBatchCount <= 0 && isDoubaoWorkerUsable(window)) window.destroy();
+      } catch { /* 窗口已损坏时由健康检查/重建链处理 */ }
     }
-    if (!doubaoWindow || doubaoWindow.isDestroyed()) doubaoWindow = null;
+    if (!isDoubaoWorkerUsable(doubaoWindow)) doubaoWindow = null;
   }
 }
 
 async function waitForDoubaoLoad(browser) {
-  if (!browser.webContents.isLoading()) return;
+  if (!isDoubaoWorkerUsable(browser)) throw workerDestroyedError();
+  const contents = safeWebContents(browser);
+  if (!contents) throw workerDestroyedError();
+  if (!contents.isLoading()) return;
   await new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
-      browser.webContents.removeListener('did-finish-load', onFinish);
-      browser.webContents.removeListener('did-fail-load', onFail);
+      try { contents.removeListener('did-finish-load', onFinish); } catch {}
+      try { contents.removeListener('did-fail-load', onFail); } catch {}
+      try { contents.removeListener('destroyed', onDestroyed); } catch {}
     };
     const onFinish = () => {
       cleanup();
       resolve();
     };
+    const onDestroyed = () => {
+      cleanup();
+      reject(workerDestroyedError());
+    };
     // 加载失败（断网、DNS 失败等）立即报错，不再干等超时；子资源失败（isMainFrame=false）忽略
     const onFail = (_event, errorCode, errorDescription, _url, isMainFrame) => {
-      if (!isMainFrame || errorCode === -3) return; // -3 = ERR_ABORTED，页面内部跳转常见，忽略
+      if (!isMainFrame || errorCode === -3) return;
       cleanup();
       reject(new Error(`豆包页面加载失败（${errorDescription || errorCode}），请检查网络后重试`));
     };
@@ -756,8 +766,9 @@ async function waitForDoubaoLoad(browser) {
       cleanup();
       reject(new Error('豆包页面加载超时'));
     }, 35_000);
-    browser.webContents.on('did-finish-load', onFinish);
-    browser.webContents.on('did-fail-load', onFail);
+    contents.on('did-finish-load', onFinish);
+    contents.on('did-fail-load', onFail);
+    contents.once('destroyed', onDestroyed);
   });
 }
 
