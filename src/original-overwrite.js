@@ -83,28 +83,26 @@ async function replaceOriginalSafely({ sourcePath, resultPath, nativeImage }) {
     await fs.writeFile(temporaryPath, encoded.buffer, { mode: originalStat.mode });
     await fs.chmod(temporaryPath, originalStat.mode).catch(() => {});
 
+    // 覆盖前先留一份同目录临时备份。即使替换后校验失败或进程遇到文件系统异常，也能把原图恢复。
+    await fs.copyFile(sourcePath, backupPath);
+    backupCreated = true;
+
     try {
-      // 同目录 rename 在支持覆盖的系统上是原子替换；Windows 若拒绝覆盖现有文件则走备份交换。
+      // 支持覆盖目标的系统直接原子 rename；Windows 若拒绝已有目标，则在备份已就绪后删除目标再交换。
       await fs.rename(temporaryPath, sourcePath);
     } catch (error) {
       if (!['EEXIST', 'EPERM', 'EACCES'].includes(error?.code)) throw error;
-      await fs.rename(sourcePath, backupPath);
-      backupCreated = true;
-      try {
-        await fs.rename(temporaryPath, sourcePath);
-      } catch (swapError) {
-        await fs.rename(backupPath, sourcePath).catch(() => {});
-        backupCreated = false;
-        throw swapError;
-      }
-      await fs.rm(backupPath, { force: true }).catch(() => {});
-      backupCreated = false;
+      await fs.rm(sourcePath, { force: true });
+      await fs.rename(temporaryPath, sourcePath);
     }
 
     const finalImage = nativeImage.createFromPath(sourcePath);
     if (finalImage.isEmpty()) {
       throw new Error('覆盖后校验失败：原图位置的新文件无法读取');
     }
+
+    await fs.rm(backupPath, { force: true }).catch(() => {});
+    backupCreated = false;
 
     if (path.resolve(resultPath) !== path.resolve(sourcePath)) {
       await fs.rm(resultPath, { force: true }).catch(() => {});
@@ -119,12 +117,12 @@ async function replaceOriginalSafely({ sourcePath, resultPath, nativeImage }) {
   } catch (error) {
     if (backupCreated) {
       await fs.rm(sourcePath, { force: true }).catch(() => {});
-      await fs.rename(backupPath, sourcePath).catch(() => {});
+      await fs.copyFile(backupPath, sourcePath).catch(() => {});
     }
     throw error;
   } finally {
     await fs.rm(temporaryPath, { force: true }).catch(() => {});
-    if (backupCreated) await fs.rm(backupPath, { force: true }).catch(() => {});
+    await fs.rm(backupPath, { force: true }).catch(() => {});
   }
 }
 
