@@ -978,6 +978,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               timeoutMs: 90_000
             });
           } catch (auditError) {
+            if (auditError.code === 'CANCELLED' || auditError.code === 'VERIFICATION_INTERRUPTED') {
+              await fs.rm(saved.path, { force: true }).catch(() => {});
+              throw auditError;
+            }
             residualStatus = 'audit-failed';
             batchEvent({
               type: 'job-progress',
@@ -1115,6 +1119,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             autoRepairPasses += 1;
             residualStatus = 'repaired-pending-audit';
           } catch (repairError) {
+            if (repairError.code === 'CANCELLED' || repairError.code === 'VERIFICATION_INTERRUPTED') {
+              await fs.rm(saved.path, { force: true }).catch(() => {});
+              throw repairError;
+            }
             residualStatus = 'repair-failed';
             batchEvent({
               type: 'job-progress',
