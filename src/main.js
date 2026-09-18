@@ -457,7 +457,7 @@ async function cookieLoginHint() {
 async function getLoginStatus() {
   const cookieHint = await cookieLoginHint();
   let pageStatus = null;
-  if (doubaoWindow && !doubaoWindow.isDestroyed() && !doubaoWindow.webContents.isLoading()) {
+  if (isDoubaoWorkerUsable(doubaoWindow) && !safeWebContents(doubaoWindow).isLoading()) {
     try {
       const automation = new DoubaoAutomation(doubaoWindow);
       pageStatus = await automation.getLoginStatus();
@@ -497,9 +497,9 @@ async function waitForSharedLoginRecovery(promise, cancelRef) {
 }
 
 async function loadDoubaoChatForRecovery(workerWindow) {
-  if (!workerWindow || workerWindow.isDestroyed()) {
-    const error = new Error('豆包工作窗口已关闭，无法自动恢复登录');
-    error.code = 'LOGIN_RECOVERY_FAILED';
+  if (!isDoubaoWorkerUsable(workerWindow)) {
+    const error = workerDestroyedError();
+    error.code = 'WORKER_DESTROYED';
     throw error;
   }
   await Promise.race([
@@ -519,8 +519,8 @@ async function recoverDoubaoLogin(workerWindow, {
 } = {}) {
   const progress = (message) => {
     if (jobBase) batchEvent({ type: 'job-progress', ...jobBase, message });
-    if (workerWindow && !workerWindow.isDestroyed()) {
-      workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`);
+    if (isDoubaoWorkerUsable(workerWindow)) {
+      try { workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`); } catch {}
     }
   };
 
@@ -862,7 +862,7 @@ function createDoubaoWindow({ focus = true } = {}) {
   doubaoWindow.webContents.on('did-finish-load', update);
   doubaoWindow.webContents.on('did-navigate', update);
   doubaoWindow.webContents.on('did-navigate-in-page', update);
-  doubaoWindow.loadURL(DOUBAO_CHAT_URL);
+  doubaoWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
   const createdDoubaoWindow = doubaoWindow;
   createdDoubaoWindow.on('closed', () => {
     if (doubaoWindow === createdDoubaoWindow) doubaoWindow = null;
@@ -921,7 +921,7 @@ function createAuxWorkerWindow(position) {
   workerWindow.on('closed', () => {
     auxWorkerWindows = auxWorkerWindows.filter((item) => item !== workerWindow);
   });
-  workerWindow.loadURL(DOUBAO_CHAT_URL);
+  workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
   return workerWindow;
 }
 
