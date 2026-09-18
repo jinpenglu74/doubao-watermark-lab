@@ -1100,8 +1100,12 @@ async function acquireBatchWindows(count, { show, poolSize, cancelRef } = {}) {
 
   while (windows.length < needed) {
     if (cancelRef?.value) throw loginRecoveryCancelledError();
-    windows = allHealthyWorkerWindows()
-      .slice(0, fixedWorkerPoolTarget)
+    let healthy = allHealthyWorkerWindows();
+    if (healthy.length < fixedWorkerPoolTarget) {
+      await ensureFixedWorkerPool(fixedWorkerPoolTarget);
+      healthy = allHealthyWorkerWindows();
+    }
+    windows = healthy
       .filter((window) => !busyWindows.has(window))
       .slice(0, needed);
 
@@ -1907,10 +1911,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         }).catch(() => {});
       }
     } catch (error) {
-      if (mode !== 'manual') {
-        const state = workerPoolState(workerWindow);
-        if (state) state.forceConversationRotate = true;
-      }
+      // 任何未完成任务都可能把当前聊天留在半成品状态；下一张任务强制换一个干净聊天。
+      const state = workerPoolState(workerWindow);
+      if (state) state.forceConversationRotate = true;
       error = normalizeTaskError(error);
       if (error.code === 'CANCELLED' || cancelRef.value) return;
       if (error.code === 'VERIFICATION_INTERRUPTED') return { kind: 'retry-verification', error };
