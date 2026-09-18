@@ -1376,6 +1376,54 @@ class DoubaoAutomation {
     }
   }
 
+  async inspectLatestGeneratedResidual({ prompt, timeoutMs = 45_000 }) {
+    this.assertAlive();
+    assertNotCancelled(this.isCancelled);
+    await this.waitForVerificationIfNeeded();
+    await this.requireAuthenticated();
+
+    this.onProgress('正在当前会话直接复检上一张生成图');
+    const baseline = await runInPage(this.webContents, pageImageSnapshot);
+    await this.enterPrompt(prompt);
+    await this.waitForVerificationIfNeeded();
+    await this.sendPrompt();
+
+    const started = Date.now();
+    let lastText = '';
+    let stableSince = Date.now();
+    let lastParsed = null;
+    while (Date.now() - started < timeoutMs) {
+      assertNotCancelled(this.isCancelled);
+      assertNotRestarted(this.shouldRestart);
+      await this.waitForVerificationIfNeeded();
+      const snapshot = await runInPage(this.webContents, pageImageSnapshot);
+      const text = String(snapshot.assistantTailText || '').trim();
+      if (text !== lastText) {
+        lastText = text;
+        stableSince = Date.now();
+        lastParsed = parseWatermarkAudit(text);
+      }
+      const finished = Number(snapshot.finishedReplies) > Number(baseline.finishedReplies || 0)
+        || Number(snapshot.followUps) > Number(baseline.followUps || 0);
+      const settled = !snapshot.generating && (finished || Date.now() - stableSince > 2200);
+      if (settled && lastParsed) {
+        return {
+          ...lastParsed,
+          auditMode: 'same-conversation'
+        };
+      }
+      if (settled && text && Date.now() - stableSince > 5000) {
+        const error = new Error('同会话残留复检返回格式异常');
+        error.code = 'SAME_CONVERSATION_AUDIT_FAILED';
+        throw error;
+      }
+      await sleep(700);
+    }
+    const error = new Error('同会话残留复检超时');
+    error.code = 'SAME_CONVERSATION_AUDIT_FAILED';
+    throw error;
+  }
+
   async inspectWatermarkResidual({ filePath, prompt, timeoutMs = 90_000 }) {
     this.assertAlive();
     assertNotCancelled(this.isCancelled);
