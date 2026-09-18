@@ -17,6 +17,11 @@ const VERIFICATION_SUCCESS_PATTERN = /验证(?:成功|通过|已完成)|已(?:�
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function settledNoImageGraceMs(noImageGraceMs, sawReplyFinished) {
+  const requested = Math.max(1_000, Number(noImageGraceMs) || DEFAULT_NO_IMAGE_GRACE_MS);
+  return sawReplyFinished ? Math.min(requested, 20_000) : requested;
+}
+
 function assertNotCancelled(isCancelled) {
   if (isCancelled?.()) {
     const error = new Error('批处理已取消');
@@ -1283,12 +1288,12 @@ class DoubaoAutomation {
         const replySettled = sawReplyFinished || ((sawGenerating || sawStreaming) && tailQuietMs > 4_000);
         if (replySettled && !generationDoneSince) {
           generationDoneSince = Date.now();
-          const settledGraceMs = sawReplyFinished ? Math.min(noImageGraceMs, 20_000) : noImageGraceMs;
+          const settledGraceMs = settledNoImageGraceMs(noImageGraceMs, sawReplyFinished);
           this.onProgress(`豆包回复已结束，继续等待图片出现（最长 ${Math.round(settledGraceMs / 1000)} 秒）`);
         }
       }
 
-      const settledGraceMs = sawReplyFinished ? Math.min(noImageGraceMs, 20_000) : noImageGraceMs;
+      const settledGraceMs = settledNoImageGraceMs(noImageGraceMs, sawReplyFinished);
       if (!totalCandidates && !pendingImageCount && generationDoneSince && Date.now() - generationDoneSince > settledGraceMs) {
         throw noImageGeneratedError(snapshot.assistantTailText || snapshot.tailText, promptText);
       }
