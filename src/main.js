@@ -1166,6 +1166,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       firstPassMs: 0,
       fallbackPassMs: 0,
       downloadSaveMs: 0,
+      auditDispatchDelayMs: 0,
       auditMs: 0,
       repairMs: 0,
       qcMs: 0,
@@ -1203,6 +1204,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       timings.firstPassMs += Date.now() - firstPassStarted;
       let candidates = firstPass.candidates;
       let conversationId = firstPass.conversationId;
+      let finalGenerationReadyAt = Number(firstPass.generationReadyAt) || Date.now();
       let uploadPath = file.path;
       // 降级：接口没拦截到无水印原图时，加临时隔离带在同会话重发一次，回到白边裁切管线。
       // （第一轮无隔离带，生成图的 AI 标识落在画面内无法干净裁除，所以必须带隔离带重发；
@@ -1233,7 +1235,42 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         timings.fallbackPassMs += Date.now() - fallbackPassStarted;
         candidates = secondPass.candidates;
         conversationId = secondPass.conversationId || conversationId;
+        finalGenerationReadyAt = Number(secondPass.generationReadyAt) || Date.now();
       }
+
+      // V1.9：最终一轮生成一结束就立刻发同会话复检，不再等下载、校验、保存、QC。
+      // 下载/保存和复检并行；只有同会话复检失败时，才在保存完成后用文件重新上传兜底。
+      let immediateAuditPromise = null;
+      if (mode !== 'manual') {
+        batchEvent({
+          type: 'job-progress',
+          ...jobBase,
+          message: '生成结果已就绪，正在立即发送残留复检指令'
+        });
+        const immediateAuditStarted = Date.now();
+        immediateAuditPromise = automation.inspectLatestGeneratedResidual({
+          prompt: buildSameConversationWatermarkAuditPrompt(settings),
+          timeoutMs: 45_000,
+          skipAuthCheck: true,
+          onDispatched: (dispatchedAt) => {
+            timings.auditDispatchDelayMs = Math.max(0, Number(dispatchedAt) - finalGenerationReadyAt);
+            batchEvent({
+              type: 'job-progress',
+              ...jobBase,
+              message: `残留复检指令已发出（生成后 ${(timings.auditDispatchDelayMs / 1000).toFixed(1)} 秒）`
+            });
+          }
+        }).then((audit) => ({
+          audit,
+          error: null,
+          elapsedMs: Date.now() - immediateAuditStarted
+        })).catch((error) => ({
+          audit: null,
+          error,
+          elapsedMs: Date.now() - immediateAuditStarted
+        }));
+      }
+
       const downloadSaveStarted = Date.now();
       let candidate;
       try {
@@ -1255,6 +1292,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ...jobBase,
           message: '大图链接不可直接下载，切换到高清画布导出'
         });
+        // 高清画布导出依赖页面 DOM；若同会话复检正在回复，先让它结束，避免互相抢页面状态。
+        if (immediateAuditPromise) await immediateAuditPromise.catch(() => {});
         try {
           candidate = await automation.captureLatestGeneratedCanvas(nativeImage, candidates);
         } catch (canvasError) {
@@ -1271,6 +1310,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ...jobBase,
           message: '候选资源与上传图片完全相同，已作废并切换到生成结果画布'
         });
+        if (immediateAuditPromise) await immediateAuditPromise.catch(() => {});
         try {
           candidate = await automation.captureLatestGeneratedCanvas(nativeImage, candidates);
         } catch (canvasError) {
@@ -1310,10 +1350,19 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             });
             const auditStarted = Date.now();
             try {
-              audit = await automation.inspectLatestGeneratedResidual({
-                prompt: buildSameConversationWatermarkAuditPrompt(settings),
-                timeoutMs: 45_000
-              });
+              if (auditIndex === 0 && immediateAuditPromise) {
+                const prefetched = await immediateAuditPromise;
+                timings.auditMs += Number(prefetched.elapsedMs) || 0;
+                if (prefetched.error) throw prefetched.error;
+                audit = prefetched.audit;
+              } else {
+                audit = await automation.inspectLatestGeneratedResidual({
+                  prompt: buildSameConversationWatermarkAuditPrompt(settings),
+                  timeoutMs: 45_000,
+                  skipAuthCheck: true
+                });
+                timings.auditMs += Date.now() - auditStarted;
+              }
               sameConversationAuditCount += 1;
               batchEvent({
                 type: 'job-progress',
@@ -1330,13 +1379,14 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
                 ...jobBase,
                 message: `同会话复检未完成：${sameAuditError.message || sameAuditError}；正在回退到重新上传复检`
               });
+              const fallbackAuditStarted = Date.now();
               audit = await automation.inspectWatermarkResidual({
                 filePath: saved.path,
                 prompt: buildWatermarkAuditPrompt(settings),
                 timeoutMs: 90_000
               });
+              timings.auditMs += Date.now() - fallbackAuditStarted;
             }
-            timings.auditMs += Date.now() - auditStarted;
           } catch (auditError) {
             if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(auditError.code) || isDestroyedObjectError(auditError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
@@ -1592,6 +1642,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       const timingSummary = [
         `首次处理 ${seconds(timings.firstPassMs)}秒`,
         timings.fallbackPassMs > 0 ? `降级重发 ${seconds(timings.fallbackPassMs)}秒` : '',
+        `复检发起 ${seconds(timings.auditDispatchDelayMs)}秒`,
         `复检 ${seconds(timings.auditMs)}秒`,
         timings.repairMs > 0 ? `补修 ${seconds(timings.repairMs)}秒` : '',
         settings.overwriteOriginal ? `质检 ${seconds(timings.qcMs)}秒` : '质检 后台',
