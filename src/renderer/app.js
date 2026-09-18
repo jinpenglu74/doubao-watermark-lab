@@ -396,7 +396,7 @@ function makeQueueItem(file, index) {
     const flag = document.createElement('span');
     flag.className = 'capture-flag is-page';
     flag.textContent = t('耗时 {n}秒', { n: (file.timings.totalMs / 1000).toFixed(1) });
-    flag.title = file.timingSummary || '';
+    flag.title = t(file.timingSummary || '');
     copy.append(flag);
   }
     if (file.status === 'complete' && file.captureSource) {
