@@ -26,11 +26,12 @@ function assertNotCancelled(isCancelled) {
 
 // 同批其他任务完成安全验证后，本任务也可能已被风控波及：抛出专属错误，由调度方整任务重启
 function assertNotRestarted(shouldRestart) {
-  if (shouldRestart?.()) {
-    const error = new Error('安全验证已中断本次任务');
-    error.code = 'VERIFICATION_INTERRUPTED';
-    throw error;
-  }
+  const restart = shouldRestart?.();
+  if (!restart) return;
+  const loginRestart = restart === 'login' || restart?.reason === 'login';
+  const error = new Error(loginRestart ? '豆包登录会话已恢复，需要重新开始本次任务' : '安全验证已中断本次任务');
+  error.code = loginRestart ? 'LOGIN_RECOVERED_RESTART' : 'VERIFICATION_INTERRUPTED';
+  throw error;
 }
 
 async function waitFor(predicate, {
@@ -196,6 +197,7 @@ function parseWatermarkAudit(text) {
 
 function pageLoginStatus() {
   const visible = (element) => {
+    if (!element) return false;
     const rect = element.getBoundingClientRect();
     const style = getComputedStyle(element);
     return rect.width > 2 && rect.height > 2 && style.visibility !== 'hidden' && style.display !== 'none';
@@ -203,13 +205,58 @@ function pageLoginStatus() {
   const controls = [...document.querySelectorAll('button, a, [role="button"]')]
     .filter(visible)
     .map((element) => `${element.innerText || ''} ${element.getAttribute('aria-label') || ''} ${element.title || ''}`.trim());
-  const hasLogin = controls.some((text) => /^(登录|注册|登录豆包|立即登录)/.test(text));
+  const hasLogin = controls.some((text) => /^(登录|注册|登录豆包|立即登录)(?:\s|$)/.test(text));
   const hasAccount = Boolean(document.querySelector('img[src*="user-avatar" i], button[aria-haspopup="menu"] img[src*="avatar" i], [data-testid*="user-avatar" i], img[alt*="头像"]'));
+  const hasComposer = [...document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]')]
+    .some((element) => visible(element) && !element.disabled && element.getAttribute('aria-disabled') !== 'true');
+  // 文件 input 通常是隐藏的，存在即可视为聊天能力信号，不要求 visible。
+  const hasUpload = Boolean(document.querySelector('input[type="file"]'));
+  const url = location.href;
+  const isChatUrl = /\/chat(?:\/|[?#]|$)/i.test(location.pathname + location.search + location.hash);
+  const isLoginPage = /\/(?:login|passport|auth)(?:\/|[?#]|$)/i.test(location.pathname)
+    || /passport|login/i.test(location.hostname) && !/doubao\.com$/i.test(location.hostname);
   return {
-    loggedIn: hasAccount && !hasLogin,
     hasLogin,
     hasAccount,
-    url: location.href
+    hasComposer,
+    hasUpload,
+    isChatUrl,
+    isLoginPage,
+    url
+  };
+}
+
+function classifyLoginState(pageStatus = {}, cookieHint = false) {
+  const hasLogin = pageStatus?.hasLogin === true;
+  const hasAccount = pageStatus?.hasAccount === true;
+  const hasComposer = pageStatus?.hasComposer === true;
+  const hasUpload = pageStatus?.hasUpload === true;
+  const isChatUrl = pageStatus?.isChatUrl === true || /\/chat(?:\/|[?#]|$)/i.test(String(pageStatus?.url || ''));
+  const isLoginPage = pageStatus?.isLoginPage === true;
+
+  let score = 0;
+  if (hasComposer) score += 4;
+  if (hasUpload) score += 3;
+  if (hasAccount) score += 3;
+  if (cookieHint) score += 2;
+  if (isChatUrl) score += 1;
+  if (hasLogin) score -= 5;
+  if (isLoginPage) score -= 5;
+
+  let state = 'uncertain';
+  // 可实际发送消息/上传文件比头像是否渲染更可靠，避免侧栏折叠或 DOM 重绘造成假退出。
+  if (!hasLogin && !isLoginPage && (hasComposer || hasUpload || hasAccount) && score >= 4) {
+    state = 'authenticated';
+  } else if ((hasLogin || isLoginPage) && !hasComposer && !hasUpload && !hasAccount) {
+    state = 'logged-out';
+  }
+
+  return {
+    ...pageStatus,
+    cookieHint: Boolean(cookieHint),
+    state,
+    score,
+    loggedIn: state === 'authenticated'
   };
 }
 
@@ -720,11 +767,62 @@ class DoubaoAutomation {
     this.onVerificationCleared = options.onVerificationCleared || null;
   }
 
+  async cookieLoginHint() {
+    try {
+      const cookies = await this.session.cookies.get({ url: 'https://www.doubao.com/' });
+      return cookies.some((cookie) => !/csrf/i.test(cookie.name)
+        && /^(?:sessionid(?:_ss)?|sid_(?:guard|tt)|uid_tt(?:_ss)?|passport_auth_status|sso_auth_status)$/i.test(cookie.name));
+    } catch {
+      return false;
+    }
+  }
+
   async getLoginStatus() {
     if (this.webContents.isLoading()) {
-      await waitFor(() => !this.webContents.isLoading(), { timeout: 25_000, isCancelled: this.isCancelled });
+      await waitFor(() => !this.webContents.isLoading(), {
+        timeout: 25_000,
+        isCancelled: this.isCancelled,
+        message: '豆包页面加载超时'
+      }).catch((error) => {
+        if (error?.code === 'CANCELLED') throw error;
+      });
     }
-    return runInPage(this.webContents, pageLoginStatus);
+    const [pageStatus, cookieHint] = await Promise.all([
+      runInPage(this.webContents, pageLoginStatus).catch(() => null),
+      this.cookieLoginHint()
+    ]);
+    return classifyLoginState(pageStatus || {}, cookieHint);
+  }
+
+  async confirmLoginStatus({ attempts = 3 } = {}) {
+    const total = Math.min(5, Math.max(2, Math.round(Number(attempts) || 3)));
+    let last = null;
+    let consecutiveLoggedOut = 0;
+    for (let attempt = 0; attempt < total; attempt += 1) {
+      assertNotCancelled(this.isCancelled);
+      last = await this.getLoginStatus().catch((error) => {
+        if (error?.code === 'CANCELLED') throw error;
+        return classifyLoginState({}, false);
+      });
+      if (last.state === 'authenticated') return { ...last, confirmed: true, checks: attempt + 1 };
+      consecutiveLoggedOut = last.state === 'logged-out' ? consecutiveLoggedOut + 1 : 0;
+      // 明确退出也必须连续出现两次，避免页面切换/重绘瞬间把登录按钮误当成真实退出。
+      if (consecutiveLoggedOut >= 2) return { ...last, confirmed: true, checks: attempt + 1 };
+      if (attempt < total - 1) {
+        this.onProgress(`登录状态异常，正在自动复查（${attempt + 1}/${total}）`);
+        await sleep(attempt === 0 ? 800 : 1400);
+      }
+    }
+    return { ...(last || classifyLoginState({}, false)), confirmed: false, checks: total };
+  }
+
+  async requireAuthenticated() {
+    const status = await this.confirmLoginStatus({ attempts: 3 });
+    if (status.state === 'authenticated') return status;
+    const error = new Error('豆包登录状态需要恢复');
+    error.code = 'LOGIN_RECOVERY_REQUIRED';
+    error.authStatus = status;
+    throw error;
   }
 
   async waitForVerificationIfNeeded(maxWaitMs = 10 * 60_000) {
@@ -1175,8 +1273,7 @@ class DoubaoAutomation {
     }
     // 历史对话接不上（已删除等）时也开新对话，避免内容发进无关会话
     if (!resumed && (newConversation || conversationId)) await this.freshConversation();
-    const login = await this.getLoginStatus();
-    if (!login.loggedIn) throw new Error('豆包登录状态已失效，请重新登录后继续');
+    await this.requireAuthenticated();
 
     await this.attachFile(filePath);
     // 上传完成后再填提示词：实测豆包在传图期间向输入框写入文字可能触发重渲染、冲掉未完成的附件
@@ -1225,8 +1322,7 @@ class DoubaoAutomation {
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
     await this.freshConversation();
-    const login = await this.getLoginStatus();
-    if (!login.loggedIn) throw new Error('豆包登录状态已失效，请重新登录后继续');
+    await this.requireAuthenticated();
 
     this.onProgress('正在全图复检残留水印');
     await this.attachFile(filePath);
@@ -1408,6 +1504,7 @@ module.exports = {
   harvestSseText,
   imageAssetKey,
   noImageGeneratedError,
+  classifyLoginState,
   parseWatermarkAudit,
   pageLoginStatus,
   pageVerificationState,
