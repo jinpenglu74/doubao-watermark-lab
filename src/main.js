@@ -1258,7 +1258,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     mode,
     path: runtime.eventPath || null,
     parallel: useParallel,
-    workers: useParallel ? windows.length : 1
+    workers: useParallel ? windows.length : 1,
+    workerPoolSize: fixedWorkerPoolTarget
   });
   const results = [];
 
@@ -2129,26 +2130,50 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
   };
 
   try {
+    const runWithDispatchPermit = async (index, slot) => {
+      const file = files[index];
+      const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
+      const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
+      const dispatchBase = {
+        index,
+        batchId,
+        path: eventPath,
+        name: path.basename(sourcePath),
+        total: files.length,
+        mode
+      };
+      const releasePermit = await waitForWorkerDispatchPermit({
+        slot,
+        cancelRef,
+        jobBase: dispatchBase,
+        maxConcurrent: configuredPoolSize
+      });
+      try {
+        await processAt(index, slot);
+      } finally {
+        releasePermit();
+      }
+    };
+
     if (!useParallel) {
       for (let index = 0; index < files.length; index += 1) {
         if (cancelRef.value) break;
-        await processAt(index, workerSlots[0]);
+        await runWithDispatchPermit(index, workerSlots[0]);
         if (index < files.length - 1 && !cancelRef.value && settings.intervalSeconds > 0) {
           batchEvent({ type: 'batch-wait', seconds: settings.intervalSeconds, nextIndex: index + 1 });
           await new Promise((resolve) => setTimeout(resolve, settings.intervalSeconds * 1000));
         }
       }
     } else {
-      // 多线程：每个工作窗口独立取任务，全部同时启动，不做人为错峰。
-      // 每个任务本身要经历开对话/上传/发送多个步骤，各窗口的请求节奏天然错开；
-      // 偶发的安全验证由批次级验证兜底机制处理（暂停 → 手动完成 → 整批自动重启）
+      // 固定工作池：每个 slot 连续接单，但新任务启动经过全局错峰门。
+      // 正常状态约 700ms 错峰；验证频繁时自动拉大到 1.5~5 秒并限制新任务并发。
       let nextIndex = 0;
       const worker = async (slot) => {
         while (!cancelRef.value) {
           const index = nextIndex;
           nextIndex += 1;
           if (index >= files.length) return;
-          await processAt(index, slot);
+          await runWithDispatchPermit(index, slot);
         }
       };
       await Promise.all(workerSlots.map((slot) => worker(slot)));
