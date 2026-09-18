@@ -1267,12 +1267,16 @@ class DoubaoAutomation {
   async processImage({ filePath, prompt, newConversation = true, conversationId = '', imageWaitSeconds = 0 }) {
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
+    // 登录检查放在任何会话导航之前：真实退出时不要先去点“新对话”然后报普通 DOM 错误，
+    // 必须抛出 LOGIN_RECOVERY_REQUIRED 交给主调度自动恢复。
+    await this.requireAuthenticated();
     let resumed = false;
     if (conversationId) {
       resumed = await this.openConversation(conversationId).catch(() => false);
     }
     // 历史对话接不上（已删除等）时也开新对话，避免内容发进无关会话
     if (!resumed && (newConversation || conversationId)) await this.freshConversation();
+    // 导航后再快速确认一次，覆盖“打开历史会话时刚好跳登录页”的边界情况。
     await this.requireAuthenticated();
 
     await this.attachFile(filePath);
@@ -1321,6 +1325,7 @@ class DoubaoAutomation {
   async inspectWatermarkResidual({ filePath, prompt, timeoutMs = 90_000 }) {
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
+    await this.requireAuthenticated();
     await this.freshConversation();
     await this.requireAuthenticated();
 
