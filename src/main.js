@@ -794,8 +794,8 @@ async function logoutDoubao() {
 
   const persistentSession = session.fromPartition(DOUBAO_PARTITION);
   for (const window of BrowserWindow.getAllWindows()) {
-    if (window !== mainWindow && !window.isDestroyed() && window.webContents.session === persistentSession) {
-      window.destroy();
+    if (window !== mainWindow && windowUsesDoubaoSession(window, persistentSession)) {
+      try { window.destroy(); } catch {}
     }
   }
   doubaoWindow = null;
@@ -813,13 +813,14 @@ async function logoutDoubao() {
 }
 
 function createDoubaoWindow({ focus = true } = {}) {
-  if (doubaoWindow && !doubaoWindow.isDestroyed()) {
+  if (doubaoWindow && isDoubaoWorkerUsable(doubaoWindow)) {
     if (focus) doubaoWindow.show();
     return doubaoWindow;
   }
+  if (doubaoWindow) discardDoubaoWorker(doubaoWindow);
 
   configureDoubaoSession();
-  doubaoWindow = new BrowserWindow({
+  doubaoWindow = bindDoubaoWorkerHealth(new BrowserWindow({
     width: 1120,
     height: 820,
     minWidth: 780,
@@ -835,7 +836,7 @@ function createDoubaoWindow({ focus = true } = {}) {
       backgroundThrottling: false,
       safeDialogs: true
     }
-  });
+  }));
 
   doubaoWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -862,12 +863,15 @@ function createDoubaoWindow({ focus = true } = {}) {
   doubaoWindow.webContents.on('did-navigate', update);
   doubaoWindow.webContents.on('did-navigate-in-page', update);
   doubaoWindow.loadURL(DOUBAO_CHAT_URL);
-  doubaoWindow.on('closed', () => {
-    doubaoWindow = null;
-    loginFlowActive = false;
-    clearInterval(loginTimer);
-    loginTimer = null;
-    broadcastLoginStatus();
+  const createdDoubaoWindow = doubaoWindow;
+  createdDoubaoWindow.on('closed', () => {
+    if (doubaoWindow === createdDoubaoWindow) doubaoWindow = null;
+    if (activeBatchCount <= 0) {
+      loginFlowActive = false;
+      clearInterval(loginTimer);
+      loginTimer = null;
+    }
+    broadcastLoginStatus().catch(() => {});
   });
   loginTimer = setInterval(broadcastLoginStatus, 5000);
   return doubaoWindow;
@@ -876,7 +880,7 @@ function createDoubaoWindow({ focus = true } = {}) {
 let auxWorkerWindows = [];
 
 function createAuxWorkerWindow(position) {
-  const workerWindow = new BrowserWindow({
+  const workerWindow = bindDoubaoWorkerHealth(new BrowserWindow({
     width: 1120,
     height: 820,
     minWidth: 780,
@@ -892,7 +896,7 @@ function createAuxWorkerWindow(position) {
       backgroundThrottling: false,
       safeDialogs: true
     }
-  });
+  }));
 
   workerWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -924,8 +928,8 @@ function createAuxWorkerWindow(position) {
 function hideIdleDoubaoWindows() {
   const persistentSession = session.fromPartition(DOUBAO_PARTITION);
   for (const window of BrowserWindow.getAllWindows()) {
-    if (window !== mainWindow && !window.isDestroyed() && window.webContents.session === persistentSession && !busyWindows.has(window)) {
-      window.hide();
+    if (window !== mainWindow && windowUsesDoubaoSession(window, persistentSession) && !busyWindows.has(window)) {
+      try { window.hide(); } catch {}
     }
   }
 }
@@ -934,7 +938,7 @@ function hideIdleDoubaoWindows() {
 async function acquireBatchWindows(count, { show }) {
   createDoubaoWindow({ focus: false });
   const idleWindows = () => [doubaoWindow, ...auxWorkerWindows]
-    .filter((window) => window && !window.isDestroyed() && !busyWindows.has(window));
+    .filter((window) => isDoubaoWorkerUsable(window) && !busyWindows.has(window));
   const windows = [];
   for (let index = 0; index < count; index += 1) {
     let window = idleWindows().find((item) => !windows.includes(item));
