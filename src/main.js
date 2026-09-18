@@ -457,7 +457,8 @@ async function cookieLoginHint() {
 async function getLoginStatus() {
   const cookieHint = await cookieLoginHint();
   let pageStatus = null;
-  if (isDoubaoWorkerUsable(doubaoWindow) && !safeWebContents(doubaoWindow).isLoading()) {
+  const loginContents = safeWebContents(doubaoWindow);
+  if (isDoubaoWorkerUsable(doubaoWindow) && loginContents && !loginContents.isLoading()) {
     try {
       const automation = new DoubaoAutomation(doubaoWindow);
       pageStatus = await automation.getLoginStatus();
@@ -876,13 +877,12 @@ function createDoubaoWindow({ focus = true } = {}) {
   const createdDoubaoWindow = doubaoWindow;
   createdDoubaoWindow.on('closed', () => {
     if (doubaoWindow === createdDoubaoWindow) doubaoWindow = null;
-    if (activeBatchCount <= 0) {
-      loginFlowActive = false;
-      clearInterval(loginTimer);
-      loginTimer = null;
-    }
+    if (activeBatchCount <= 0) loginFlowActive = false;
+    clearInterval(loginTimer);
+    loginTimer = null;
     broadcastLoginStatus().catch(() => {});
   });
+  clearInterval(loginTimer);
   loginTimer = setInterval(broadcastLoginStatus, 5000);
   return doubaoWindow;
 }
