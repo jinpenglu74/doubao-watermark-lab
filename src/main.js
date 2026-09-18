@@ -28,6 +28,16 @@ const {
   workerDestroyedError
 } = require('./task-retry');
 const { writeZipFile } = require('./zip-writer');
+const {
+  CONVERSATION_IMAGE_LIMIT,
+  CONVERSATION_MAX_AGE_MS,
+  conversationRotationReason,
+  dispatchSpacingMs,
+  effectiveConcurrency,
+  effectiveVerificationLevel,
+  registerVerificationCleared,
+  registerVerificationTrigger
+} = require('./worker-pool-policy');
 
 const DOUBAO_PARTITION = 'persist:watermark-lab-doubao';
 const APP_ICON_PATH = path.join(__dirname, 'assets', 'app-icon.png');
@@ -123,6 +133,14 @@ const verificationEpoch = { value: 0 };
 // 其他任务等待同一 Promise；恢复成功后 loginRecoveryEpoch 递增，通知所有受影响任务从头重跑。
 const loginRecoveryGate = { owner: null, promise: null };
 const loginRecoveryEpoch = { value: 0 };
+
+// V2.0 固定工作池：并发设置决定池大小，任务只租用池内窗口，不再按图片无限创建窗口。
+// 验证风险调度会在近期频繁触发验证时自动降并发/加大错峰，稳定 10 分钟后恢复。
+let fixedWorkerPoolTarget = PARALLEL_WORKER_COUNT;
+let activeWorkerTasks = 0;
+const workerDispatchGate = { nextAt: 0 };
+let verificationRisk = { level: 0, lastTriggeredAt: 0, cooldownUntil: 0 };
+
 let tempFileSeq = 0;
 
 // 并发批次可能同时写同一文件，临时文件名必须唯一，避免 rename 竞态
@@ -645,6 +663,109 @@ async function recoverDoubaoLogin(workerWindow, {
       loginRecoveryGate.owner = null;
       loginRecoveryGate.promise = null;
     }
+  }
+}
+
+function workerPoolState(browserWindow, position = 0) {
+  if (!browserWindow) return null;
+  if (!browserWindow.__watermarkWorkerPoolState) {
+    browserWindow.__watermarkWorkerPoolState = {
+      position: Math.max(0, Number(position) || 0),
+      conversationStartedAt: 0,
+      conversationImageCount: 0,
+      forceConversationRotate: true,
+      completedTasks: 0
+    };
+  } else {
+    browserWindow.__watermarkWorkerPoolState.position = Math.max(0, Number(position) || 0);
+  }
+  return browserWindow.__watermarkWorkerPoolState;
+}
+
+function resetWorkerConversationState(browserWindow, { forceRotate = true } = {}) {
+  const state = workerPoolState(browserWindow);
+  if (!state) return;
+  state.conversationStartedAt = 0;
+  state.conversationImageCount = 0;
+  state.forceConversationRotate = forceRotate;
+}
+
+function planWorkerConversation(browserWindow, now = Date.now()) {
+  const state = workerPoolState(browserWindow);
+  const reason = conversationRotationReason({
+    startedAt: state?.conversationStartedAt || 0,
+    imageCount: state?.conversationImageCount || 0,
+    forceRotate: state?.forceConversationRotate === true
+  }, now);
+  return { rotate: Boolean(reason), reason, state };
+}
+
+function markWorkerConversationStarted(browserWindow, now = Date.now()) {
+  const state = workerPoolState(browserWindow);
+  if (!state) return;
+  state.conversationStartedAt = now;
+  state.conversationImageCount = 0;
+  state.forceConversationRotate = false;
+}
+
+function markWorkerImageCompleted(browserWindow) {
+  const state = workerPoolState(browserWindow);
+  if (!state) return;
+  state.conversationImageCount += 1;
+  state.completedTasks += 1;
+}
+
+function allHealthyWorkerWindows() {
+  return [doubaoWindow, ...auxWorkerWindows]
+    .filter((window, index, items) => window && items.indexOf(window) === index)
+    .filter((window) => isDoubaoWorkerUsable(window));
+}
+
+function verificationRiskLevel() {
+  return effectiveVerificationLevel(verificationRisk, Date.now());
+}
+
+function registerVerificationRisk() {
+  verificationRisk = registerVerificationTrigger(verificationRisk, Date.now());
+  return verificationRisk;
+}
+
+function clearVerificationRisk() {
+  verificationRisk = registerVerificationCleared(verificationRisk, Date.now());
+  return verificationRisk;
+}
+
+async function waitForWorkerDispatchPermit({ slot, cancelRef, jobBase, maxConcurrent }) {
+  let lastNoticeAt = 0;
+  while (true) {
+    if (cancelRef?.value) throw loginRecoveryCancelledError();
+    const now = Date.now();
+    const level = verificationRiskLevel();
+    const allowedConcurrency = effectiveConcurrency(maxConcurrent, verificationRisk, now);
+    const coolingDown = now < (Number(verificationRisk.cooldownUntil) || 0);
+    const verificationActive = Boolean(verificationGate.owner);
+
+    if (!verificationActive && !coolingDown && activeWorkerTasks < allowedConcurrency && now >= workerDispatchGate.nextAt) {
+      activeWorkerTasks += 1;
+      workerDispatchGate.nextAt = now + dispatchSpacingMs(verificationRisk, now);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        activeWorkerTasks = Math.max(0, activeWorkerTasks - 1);
+      };
+    }
+
+    if (jobBase && now - lastNoticeAt > 5000 && (verificationActive || coolingDown || level >= 2)) {
+      lastNoticeAt = now;
+      const message = verificationActive
+        ? '豆包正在进行安全验证，新任务已暂停派发'
+        : level >= 2
+          ? `近期验证较频繁，已自动降到最多 ${allowedConcurrency} 个新任务并发`
+          : '安全验证刚恢复，正在短暂冷却后继续';
+      batchEvent({ type: 'job-progress', ...jobBase, message });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
 
