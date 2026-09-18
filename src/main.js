@@ -969,6 +969,24 @@ async function acquireBatchWindows(count, { show }) {
   return windows;
 }
 
+async function rebuildBatchWorker(slot, { show = false } = {}) {
+  const previous = slot?.window || null;
+  if (previous) discardDoubaoWorker(previous);
+
+  const replacement = createAuxWorkerWindow(Number(slot?.position) || 0);
+  auxWorkerWindows.push(replacement);
+  busyWindows.add(replacement);
+  if (!replacement.__baseTitle) replacement.__baseTitle = replacement.getTitle();
+  if (slot) slot.window = replacement;
+
+  if (show) {
+    replacement.setPosition(90 + (Number(slot?.position) || 0) * 56, 70 + (Number(slot?.position) || 0) * 48);
+    replacement.show();
+  }
+  await waitForDoubaoLoad(replacement);
+  return replacement;
+}
+
 async function validateImagePaths(paths) {
   const unique = [...new Set((paths || []).filter((value) => typeof value === 'string').map((value) => path.resolve(value)))];
   const valid = [];
