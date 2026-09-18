@@ -528,7 +528,7 @@ async function recoverDoubaoLogin(workerWindow, {
     progress('另一个任务正在恢复豆包登录，本任务已暂停等待');
     try {
       const result = await waitForSharedLoginRecovery(loginRecoveryGate.promise, cancelRef);
-      if (workerWindow && !workerWindow.isDestroyed()) {
+      if (isDoubaoWorkerUsable(workerWindow)) {
         await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
       }
       return result;
@@ -603,8 +603,8 @@ async function recoverDoubaoLogin(workerWindow, {
       const current = await loginAutomation.getLoginStatus().catch(() => null);
       if (current?.state === 'authenticated') {
         loginFlowActive = false;
-        try { workerWindow.webContents.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
-        if (!keepVisible && !workerWindow.isDestroyed()) workerWindow.hide();
+        try { safeWebContents(workerWindow)?.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
+        if (!keepVisible && isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
         progress('登录会话已恢复，正在重新开始任务');
         return { recovered: true, stage: 'interactive-login' };
       }
