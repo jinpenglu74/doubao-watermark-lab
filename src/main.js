@@ -110,6 +110,10 @@ const inUseConversations = new Set();
 // 领头完成验证后 verificationEpoch 递增广播重启信号，所有被波及的任务自动整体重跑
 const verificationGate = { owner: null };
 const verificationEpoch = { value: 0 };
+// 登录恢复也做成全局单领头：并发任务同时发现登录异常时只允许一个窗口执行恢复/登录，
+// 其他任务等待同一 Promise；恢复成功后 loginRecoveryEpoch 递增，通知所有受影响任务从头重跑。
+const loginRecoveryGate = { owner: null, promise: null };
+const loginRecoveryEpoch = { value: 0 };
 let tempFileSeq = 0;
 
 // 并发批次可能同时写同一文件，临时文件名必须唯一，避免 rename 竞态
@@ -452,13 +456,186 @@ async function getLoginStatus() {
       pageStatus = null;
     }
   }
-  const loggedIn = pageStatus ? pageStatus.loggedIn && (cookieHint || pageStatus.hasAccount) : cookieHint;
+  // 页面已确认可聊天/可上传时直接相信页面能力信号，不再要求头像必须存在；
+  // 没有可探测页面时沿用持久 Cookie 作为“可尝试自动恢复”的登录提示。
+  const loggedIn = pageStatus ? pageStatus.loggedIn === true : cookieHint;
   return {
     loggedIn,
-    cookieHint,
+    state: pageStatus?.state || (cookieHint ? 'authenticated' : 'uncertain'),
+    cookieHint: pageStatus?.cookieHint ?? cookieHint,
     pageStatus,
     persistent: true
   };
+}
+
+function loginRecoveryCancelledError() {
+  const error = new Error('批处理已取消');
+  error.code = 'CANCELLED';
+  return error;
+}
+
+async function waitForSharedLoginRecovery(promise, cancelRef) {
+  while (true) {
+    if (cancelRef?.value) throw loginRecoveryCancelledError();
+    const outcome = await Promise.race([
+      promise.then((value) => ({ done: true, value }), (error) => ({ done: true, error })),
+      new Promise((resolve) => setTimeout(() => resolve({ done: false }), 450))
+    ]);
+    if (!outcome.done) continue;
+    if (outcome.error) throw outcome.error;
+    return outcome.value;
+  }
+}
+
+async function loadDoubaoChatForRecovery(workerWindow) {
+  if (!workerWindow || workerWindow.isDestroyed()) {
+    const error = new Error('豆包工作窗口已关闭，无法自动恢复登录');
+    error.code = 'LOGIN_RECOVERY_FAILED';
+    throw error;
+  }
+  await Promise.race([
+    workerWindow.loadURL(DOUBAO_CHAT_URL),
+    new Promise((_, reject) => setTimeout(() => reject(new Error('豆包会话恢复加载超时')), 25_000))
+  ]).catch((error) => {
+    if (/ERR_ABORTED/i.test(String(error?.message || ''))) return;
+    throw error;
+  });
+  await waitForDoubaoLoad(workerWindow).catch(() => {});
+}
+
+async function recoverDoubaoLogin(workerWindow, {
+  cancelRef,
+  jobBase,
+  keepVisible = false
+} = {}) {
+  const progress = (message) => {
+    if (jobBase) batchEvent({ type: 'job-progress', ...jobBase, message });
+    if (workerWindow && !workerWindow.isDestroyed()) {
+      workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`);
+    }
+  };
+
+  if (loginRecoveryGate.promise) {
+    progress('另一个任务正在恢复豆包登录，本任务已暂停等待');
+    try {
+      const result = await waitForSharedLoginRecovery(loginRecoveryGate.promise, cancelRef);
+      if (workerWindow && !workerWindow.isDestroyed()) {
+        await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
+      }
+      return result;
+    } catch (error) {
+      // 若领头任务恰好被用户单独取消，其他仍在运行的批次不能跟着被取消；
+      // 等共享恢复槽释放后，由本任务接棒重新执行恢复。
+      if (error?.code === 'CANCELLED' && !cancelRef?.value) {
+        while (loginRecoveryGate.promise) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        return recoverDoubaoLogin(workerWindow, { cancelRef, jobBase, keepVisible });
+      }
+      throw error;
+    }
+  }
+
+  const token = { startedAt: Date.now() };
+  loginRecoveryGate.owner = token;
+  const recoveryPromise = (async () => {
+    progress('登录状态异常，正在自动恢复…');
+    const automation = () => new DoubaoAutomation(workerWindow, {
+      isCancelled: () => Boolean(cancelRef?.value),
+      onProgress: progress
+    });
+
+    // 1) 原地多次复查，先过滤头像/DOM 暂时没渲染造成的假退出。
+    let status = await automation().confirmLoginStatus({ attempts: 3 });
+    if (status.state === 'authenticated') {
+      progress('豆包登录状态正常，正在重新开始任务');
+      return { recovered: true, stage: 'recheck' };
+    }
+
+    // 2) 刷回聊天首页，仍保留 persist session 中所有 Cookie / localStorage。
+    progress('正在刷新豆包会话…');
+    await loadDoubaoChatForRecovery(workerWindow);
+    status = await automation().confirmLoginStatus({ attempts: 3 });
+    if (status.state === 'authenticated') {
+      progress('豆包会话已自动恢复，正在重新开始任务');
+      return { recovered: true, stage: 'reload' };
+    }
+
+    // 3) 软重置当前工作窗口。只重建页面上下文，不清 Cookie、不清缓存、不清登录数据。
+    progress('正在重置豆包工作窗口…');
+    try {
+      await workerWindow.loadURL('about:blank');
+      await new Promise((resolve) => setTimeout(resolve, 350));
+    } catch { /* 继续加载聊天首页 */ }
+    await loadDoubaoChatForRecovery(workerWindow);
+    status = await automation().confirmLoginStatus({ attempts: 3 });
+    if (status.state === 'authenticated') {
+      progress('豆包工作窗口已恢复，正在重新开始任务');
+      return { recovered: true, stage: 'window-reset' };
+    }
+
+    // 4) 确认真正需要登录：自动显示唯一一个登录窗口并发起登录。
+    // 若豆包能通过已有 SSO/Cookie 自动恢复会直接通过；只有短信/扫码等才需要用户操作。
+    progress('豆包需要重新登录，任务已暂停；登录成功后会自动继续');
+    loginFlowActive = true;
+    if (workerWindow.isMinimized()) workerWindow.restore();
+    workerWindow.show();
+    workerWindow.moveTop();
+    workerWindow.focus();
+    if (process.platform === 'darwin') app.focus({ steal: true });
+
+    const loginAutomation = automation();
+    await loginAutomation.openLoginDialog().catch(() => {});
+
+    const started = Date.now();
+    const maxWaitMs = 10 * 60_000;
+    while (Date.now() - started < maxWaitMs) {
+      if (cancelRef?.value) throw loginRecoveryCancelledError();
+      const current = await loginAutomation.getLoginStatus().catch(() => null);
+      if (current?.state === 'authenticated') {
+        loginFlowActive = false;
+        try { workerWindow.webContents.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
+        if (!keepVisible && !workerWindow.isDestroyed()) workerWindow.hide();
+        progress('登录会话已恢复，正在重新开始任务');
+        return { recovered: true, stage: 'interactive-login' };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+    }
+
+    const timeoutError = new Error('等待豆包重新登录超时；当前任务未丢失，可完成登录后重新开始');
+    timeoutError.code = 'LOGIN_RECOVERY_TIMEOUT';
+    throw timeoutError;
+  })();
+
+  loginRecoveryGate.promise = recoveryPromise;
+  let recoverySucceeded = false;
+  try {
+    const result = await recoveryPromise;
+    recoverySucceeded = true;
+    // 仅仅“重新复查后发现原本就已登录”不广播全局重启，避免一个窗口的假阴性打断其他正常任务。
+    if (result?.stage !== 'recheck') loginRecoveryEpoch.value += 1;
+    try {
+      if (doubaoWindow && !doubaoWindow.isDestroyed()
+        && doubaoWindow !== workerWindow && !busyWindows.has(doubaoWindow)) {
+        await loadDoubaoChatForRecovery(doubaoWindow);
+      }
+    } catch { /* 主登录窗口刷新失败不影响已恢复的工作窗口 */ }
+    // 恢复窗口已经实测可聊天，直接同步顶部状态；避免另一个尚未重载的旧窗口 DOM 短暂把状态打回“未登录”。
+    sendToRenderer('login:status', {
+      loggedIn: true,
+      state: 'authenticated',
+      cookieHint: true,
+      pageStatus: null,
+      persistent: true
+    });
+    return result;
+  } finally {
+    if (loginRecoveryGate.owner === token) {
+      if (!recoverySucceeded) loginFlowActive = false;
+      loginRecoveryGate.owner = null;
+      loginRecoveryGate.promise = null;
+    }
+  }
 }
 
 async function broadcastLoginStatus() {
@@ -786,20 +963,6 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     if (!window.isDestroyed() && window.__baseTitle) window.setTitle(window.__baseTitle);
   });
 
-  try {
-    const login = await getLoginStatus();
-    if (!login.loggedIn) {
-      loginFlowActive = true;
-      browser.show();
-      const automation = new DoubaoAutomation(browser);
-      await automation.openLoginDialog().catch(() => {});
-      throw new Error('请先在豆包窗口完成登录；登录状态会自动保存');
-    }
-  } catch (error) {
-    releaseWindows();
-    throw error;
-  }
-
   batchEvent({
     type: 'batch-start',
     batchId,
@@ -830,7 +993,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     const automation = new DoubaoAutomation(workerWindow, {
       isCancelled: () => cancelRef.value,
       // 信号值大于本任务基线，说明有任务完成了安全验证：本任务也可能已被波及，整任务重启
-      shouldRestart: () => verificationEpoch.value > epochRef.value,
+      shouldRestart: () => {
+        if (loginRecoveryEpoch.value > epochRef.login) return 'login';
+        return verificationEpoch.value > epochRef.verification;
+      },
       // 进度同时打到豆包窗口标题：开着调试窗口时能直接看到当前进行到哪一步，不再像卡住
       onProgress: (message) => {
         batchEvent({ type: 'job-progress', ...jobBase, message });
@@ -989,7 +1155,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               timeoutMs: 90_000
             });
           } catch (auditError) {
-            if (auditError.code === 'CANCELLED' || auditError.code === 'VERIFICATION_INTERRUPTED') {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(auditError.code)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw auditError;
             }
@@ -1130,7 +1296,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             autoRepairPasses += 1;
             residualStatus = 'repaired-pending-audit';
           } catch (repairError) {
-            if (repairError.code === 'CANCELLED' || repairError.code === 'VERIFICATION_INTERRUPTED') {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(repairError.code)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw repairError;
             }
@@ -1241,7 +1407,21 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       }
     } catch (error) {
       if (error.code === 'CANCELLED' || cancelRef.value) return;
-      if (error.code === 'VERIFICATION_INTERRUPTED') return 'retry';
+      if (error.code === 'VERIFICATION_INTERRUPTED') return 'retry-verification';
+      if (error.code === 'LOGIN_RECOVERED_RESTART') return 'retry-login';
+      if (error.code === 'LOGIN_RECOVERY_REQUIRED') {
+        try {
+          await recoverDoubaoLogin(workerWindow, {
+            cancelRef,
+            jobBase,
+            keepVisible: settings.showBrowserWindow
+          });
+          return 'retry-login';
+        } catch (recoveryError) {
+          if (recoveryError.code === 'CANCELLED' || cancelRef.value) return;
+          error = recoveryError;
+        }
+      }
       const result = {
         ...jobBase,
         error: error.message || String(error),
@@ -1259,52 +1439,89 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     }
   };
 
-  // 安全验证完成后整任务重启：验证中断后豆包可能假死或静默放弃生成，重跑是最可靠的恢复。
-  // 每个任务最多重启 2 次；重启信号是全局的，多线程/并发批次里正在执行的任务都会一并重跑
+  // 安全验证与登录恢复都采用“恢复完成后整任务重跑”，避免继续使用可能已失效的上传/生成上下文。
+  // 两类恢复分别计数：安全验证最多 2 次，登录恢复最多 3 次，互不占用彼此次数。
   const processAt = async (index, workerWindow) => {
     const maxVerificationRestarts = 2;
-    const epochRef = { value: verificationEpoch.value };
-    for (let attempt = 0; ; attempt += 1) {
+    const maxLoginRestarts = 3;
+    let verificationRestarts = 0;
+    let loginRestarts = 0;
+    const epochRef = {
+      verification: verificationEpoch.value,
+      login: loginRecoveryEpoch.value
+    };
+
+    while (!cancelRef.value) {
       const outcome = await processAttempt(index, workerWindow, epochRef);
-      if (outcome !== 'retry' || cancelRef.value) return;
-      if (attempt >= maxVerificationRestarts) {
-        const file = files[index];
-        const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
-        const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
-        const result = {
-          index,
-          batchId,
-          path: eventPath,
-          name: path.basename(sourcePath),
-          total: files.length,
-          mode,
-          error: '安全验证后任务仍被中断，请稍后重新开始该任务',
-          conversationId: typeof files[index].conversationId === 'string' ? files[index].conversationId : ''
-        };
-        results.push(result);
-        batchEvent({ type: 'job-error', ...result });
-        return;
-      }
-      // 验证是会话级风控，领头窗口做完一次全部窗口都解除；但本窗口页面上残留的
-      // 验证浮层不会自己消失，重跑前先整体重载回聊天页冲掉残留浮层，
-      // 避免把它误判成需要再次验证、接力弹出第二个验证窗口
-      if (workerWindow && !workerWindow.isDestroyed()) {
-        await Promise.race([
-          workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {}),
-          new Promise((resolve) => setTimeout(resolve, 15_000))
-        ]);
-      }
-      epochRef.value = verificationEpoch.value;
-      batchEvent({
-        type: 'job-progress',
+      if (!outcome || cancelRef.value) return;
+
+      const file = files[index];
+      const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
+      const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
+      const common = {
         index,
         batchId,
-        path: files.length === 1 && runtime.eventPath ? runtime.eventPath : files[index].path,
-        name: path.basename(files.length === 1 && runtime.sourcePath ? runtime.sourcePath : files[index].path),
+        path: eventPath,
+        name: path.basename(sourcePath),
         total: files.length,
-        mode,
-        message: `安全验证已中断任务，正在重新开始（第 ${attempt + 1}/${maxVerificationRestarts} 次）`
-      });
+        mode
+      };
+
+      if (outcome === 'retry-login') {
+        loginRestarts += 1;
+        if (loginRestarts > maxLoginRestarts) {
+          const result = {
+            ...common,
+            error: '豆包登录会话多次恢复后仍异常，请稍后重新开始该任务',
+            conversationId: typeof files[index].conversationId === 'string' ? files[index].conversationId : ''
+          };
+          results.push(result);
+          batchEvent({ type: 'job-error', ...result });
+          return;
+        }
+        if (workerWindow && !workerWindow.isDestroyed()) {
+          await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
+        }
+        epochRef.login = loginRecoveryEpoch.value;
+        epochRef.verification = verificationEpoch.value;
+        batchEvent({
+          type: 'job-progress',
+          ...common,
+          message: `登录会话已恢复，正在重新开始当前任务（第 ${loginRestarts}/${maxLoginRestarts} 次）`
+        });
+        continue;
+      }
+
+      if (outcome === 'retry-verification') {
+        verificationRestarts += 1;
+        if (verificationRestarts > maxVerificationRestarts) {
+          const result = {
+            ...common,
+            error: '安全验证后任务仍被中断，请稍后重新开始该任务',
+            conversationId: typeof files[index].conversationId === 'string' ? files[index].conversationId : ''
+          };
+          results.push(result);
+          batchEvent({ type: 'job-error', ...result });
+          return;
+        }
+        // 验证是会话级风控；重跑前统一刷新聊天页，清掉当前窗口残留的挑战浮层。
+        if (workerWindow && !workerWindow.isDestroyed()) {
+          await Promise.race([
+            workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {}),
+            new Promise((resolve) => setTimeout(resolve, 15_000))
+          ]);
+        }
+        epochRef.verification = verificationEpoch.value;
+        epochRef.login = loginRecoveryEpoch.value;
+        batchEvent({
+          type: 'job-progress',
+          ...common,
+          message: `安全验证已中断任务，正在重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
+        });
+        continue;
+      }
+
+      return;
     }
   };
 

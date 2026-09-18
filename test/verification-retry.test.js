@@ -212,3 +212,27 @@ test('无验证、无重启信号时：正常等到图片出现', async () => {
   const result = await harness.automation.waitForGeneratedImage(new Set(), harness.capture, 60_000, {});
   assert.ok(result.some((item) => item.url === GENERATED_IMAGE.url));
 });
+
+
+test('登录恢复 epoch 更新时：正在运行的任务立即抛出 LOGIN_RECOVERED_RESTART 重新开始', async () => {
+  const harness = createHarness({
+    verificationPlan: noVerification,
+    snapshotPlan: () => ({
+      images: [],
+      generating: true,
+      finishedReplies: 0,
+      followUps: 0,
+      tailText: '正在生成',
+      assistantTailText: ''
+    }),
+    shouldRestart: () => 'login'
+  });
+  await assert.rejects(
+    harness.automation.waitForGeneratedImage(new Set(), harness.capture, 60_000, {}),
+    (error) => {
+      assert.equal(error.code, 'LOGIN_RECOVERED_RESTART');
+      assert.match(error.message, /登录会话已恢复/);
+      return true;
+    }
+  );
+});
