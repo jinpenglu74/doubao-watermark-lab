@@ -4,6 +4,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
+const { normalizeTaskError, workerDestroyedError } = require('./task-retry');
 
 const DOUBAO_CHAT_URL = 'https://www.doubao.com/chat/';
 const UPLOAD_MARKER = 'data-watermark-lab-upload';
@@ -51,15 +52,18 @@ async function waitFor(predicate, {
 }
 
 async function runInPage(webContents, fn, ...args) {
+  if (!webContents || webContents.isDestroyed?.()) throw workerDestroyedError();
   const source = `(${fn.toString()})(...${JSON.stringify(args)})`;
   let timer = null;
   try {
     return await Promise.race([
-      webContents.executeJavaScript(source, true),
+      Promise.resolve().then(() => webContents.executeJavaScript(source, true)),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('豆包页面响应超时，请刷新页面后重试')), 30_000);
       })
     ]);
+  } catch (error) {
+    throw normalizeTaskError(error);
   } finally {
     clearTimeout(timer);
   }
@@ -756,8 +760,10 @@ function sessionCaptureHub(session) {
 
 class DoubaoAutomation {
   constructor(browserWindow, options = {}) {
+    if (!browserWindow || browserWindow.isDestroyed?.()) throw workerDestroyedError();
     this.window = browserWindow;
     this.webContents = browserWindow.webContents;
+    if (!this.webContents || this.webContents.isDestroyed?.()) throw workerDestroyedError();
     this.session = this.webContents.session;
     this.isCancelled = options.isCancelled || (() => false);
     // 任一任务完成安全验证后，同批其他任务也会被风控波及：由调度方通过该回调通知整任务重启
@@ -765,6 +771,13 @@ class DoubaoAutomation {
     this.onProgress = options.onProgress || (() => {});
     this.onVerificationRequired = options.onVerificationRequired || null;
     this.onVerificationCleared = options.onVerificationCleared || null;
+  }
+
+  assertAlive() {
+    if (!this.window || this.window.isDestroyed?.()
+      || !this.webContents || this.webContents.isDestroyed?.()) {
+      throw workerDestroyedError();
+    }
   }
 
   async cookieLoginHint() {
@@ -778,6 +791,7 @@ class DoubaoAutomation {
   }
 
   async getLoginStatus() {
+    this.assertAlive();
     if (this.webContents.isLoading()) {
       await waitFor(() => !this.webContents.isLoading(), {
         timeout: 25_000,
@@ -826,6 +840,7 @@ class DoubaoAutomation {
   }
 
   async waitForVerificationIfNeeded(maxWaitMs = 10 * 60_000) {
+    this.assertAlive();
     assertNotRestarted(this.shouldRestart);
     const first = await runInPage(this.webContents, pageVerificationState, VERIFICATION_PATTERN.source)
       .catch(() => ({ detected: false }));
@@ -890,6 +905,7 @@ class DoubaoAutomation {
   }
 
   async openLoginDialog() {
+    this.assertAlive();
     if (this.webContents.isLoading()) {
       await waitFor(() => !this.webContents.isLoading(), {
         timeout: 30_000,
@@ -925,6 +941,7 @@ class DoubaoAutomation {
   }
 
   async freshConversation() {
+    this.assertAlive();
     this.onProgress('正在创建新对话');
     const clicked = await runInPage(this.webContents, clickNewConversation).catch(() => false);
     if (clicked) {
@@ -933,7 +950,11 @@ class DoubaoAutomation {
       await sleep(800);
       return;
     }
-    await this.window.loadURL(DOUBAO_CHAT_URL);
+    try {
+      await this.window.loadURL(DOUBAO_CHAT_URL);
+    } catch (error) {
+      throw normalizeTaskError(error);
+    }
     await waitFor(() => !this.webContents.isLoading(), {
       timeout: 30_000,
       isCancelled: this.isCancelled,
@@ -943,10 +964,15 @@ class DoubaoAutomation {
   }
 
   async openConversation(conversationId) {
+    this.assertAlive();
     this.onProgress('正在打开该任务的历史对话');
     const currentUrl = await runInPage(this.webContents, () => location.href).catch(() => '');
     if (conversationIdFromUrl(currentUrl) === conversationId) return true;
-    await this.window.loadURL(`${DOUBAO_CHAT_URL}${conversationId}`);
+    try {
+      await this.window.loadURL(`${DOUBAO_CHAT_URL}${conversationId}`);
+    } catch (error) {
+      throw normalizeTaskError(error);
+    }
     await waitFor(() => !this.webContents.isLoading(), {
       timeout: 30_000,
       isCancelled: this.isCancelled,
@@ -958,6 +984,7 @@ class DoubaoAutomation {
   }
 
   async attachFile(filePath) {
+    this.assertAlive();
     this.onProgress('正在上传原图');
     const debuggerApi = this.webContents.debugger;
     if (!debuggerApi.isAttached()) debuggerApi.attach('1.3');
@@ -1117,6 +1144,7 @@ class DoubaoAutomation {
   }
 
   async enterPrompt(prompt) {
+    this.assertAlive();
     this.onProgress('正在填写处理指令');
     const result = await waitFor(
       async () => {
@@ -1134,10 +1162,16 @@ class DoubaoAutomation {
   }
 
   async sendPrompt() {
+    this.assertAlive();
     const result = await runInPage(this.webContents, clickSendButton);
     if (result.clicked) return;
-    this.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ENTER' });
-    this.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ENTER' });
+    this.assertAlive();
+    try {
+      this.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ENTER' });
+      this.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ENTER' });
+    } catch (error) {
+      throw normalizeTaskError(error);
+    }
   }
 
   async waitForGeneratedImage(baselineUrls, networkCapture, timeoutMs = 240_000, {
@@ -1265,6 +1299,7 @@ class DoubaoAutomation {
   }
 
   async processImage({ filePath, prompt, newConversation = true, conversationId = '', imageWaitSeconds = 0 }) {
+    this.assertAlive();
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
     // 登录检查放在任何会话导航之前：真实退出时不要先去点“新对话”然后报普通 DOM 错误，
@@ -1323,6 +1358,7 @@ class DoubaoAutomation {
   }
 
   async inspectWatermarkResidual({ filePath, prompt, timeoutMs = 90_000 }) {
+    this.assertAlive();
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
     await this.requireAuthenticated();
@@ -1366,6 +1402,7 @@ class DoubaoAutomation {
   }
 
   async downloadGeneratedFromEditor(nativeImage, timeoutMs = 60_000) {
+    this.assertAlive();
     const temporaryPath = path.join(os.tmpdir(), `watermark-lab-${Date.now()}-${crypto.randomUUID()}.png`);
     let activeItem = null;
     let timer = null;
@@ -1428,6 +1465,7 @@ class DoubaoAutomation {
   }
 
   async captureLatestGeneratedCanvas(nativeImage, candidates = []) {
+    this.assertAlive();
     await this.waitForVerificationIfNeeded();
     this.onProgress('链接不可用，正在从豆包高清预览导出');
     const candidateUrls = candidates.map((candidate) => typeof candidate === 'string' ? candidate : candidate?.url).filter(Boolean);
