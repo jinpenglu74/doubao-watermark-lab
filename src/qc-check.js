@@ -10,9 +10,11 @@
 const CHANGED_THRESHOLD = 16;
 // 变化像素占比 ≤ 0.3% → 疑似未处理（重编码噪声差值低于 CHANGED_THRESHOLD，不会计入占比）
 const UNCHANGED_MAX_RATIO = 0.003;
-// 变化像素占比 ≥ 85%，或整体平均差值 ≥ 32 → 差异过大
+// 大面积低强度变化可能是平铺/半透明水印被正确清除，不能只凭“变化面积大”判毁图。
+// 只有大面积变化同时具备明显强度，或全局平均差异极高，才判定差异过大。
 const DIFFERENT_MIN_RATIO = 0.85;
-const DIFFERENT_MIN_MEAN = 32;
+const DIFFERENT_RATIO_MIN_MEAN = 20;
+const DIFFERENT_MIN_MEAN = 42;
 
 /**
  * 逐像素比较两个相同尺寸的 4 通道像素缓冲（BGRA/RGBA 均可，两图格式一致即可）。
@@ -47,7 +49,8 @@ function computeDiffStats(bufferA, bufferB) {
  */
 function verdictForStats({ changedRatio, meanDiff }) {
   if (changedRatio <= UNCHANGED_MAX_RATIO) return 'unchanged';
-  if (changedRatio >= DIFFERENT_MIN_RATIO || meanDiff >= DIFFERENT_MIN_MEAN) return 'different';
+  if (meanDiff >= DIFFERENT_MIN_MEAN
+    || (changedRatio >= DIFFERENT_MIN_RATIO && meanDiff >= DIFFERENT_RATIO_MIN_MEAN)) return 'different';
   return 'ok';
 }
 
@@ -86,6 +89,7 @@ module.exports = {
   CHANGED_THRESHOLD,
   UNCHANGED_MAX_RATIO,
   DIFFERENT_MIN_RATIO,
+  DIFFERENT_RATIO_MIN_MEAN,
   DIFFERENT_MIN_MEAN,
   computeDiffStats,
   verdictForStats,
