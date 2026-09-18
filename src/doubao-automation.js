@@ -1260,8 +1260,14 @@ class DoubaoAutomation {
 
       const stableFor = Date.now() - stableSince;
       const visibleFor = firstCandidateAt ? Date.now() - firstCandidateAt : 0;
-      // 有 chat/completion 仍在流式返回时不收兵：无水印原图（api-raw）在流结束时才落袋
-      if (totalCandidates && !snapshot.generating && !apiPending && stableFor > 6500 && visibleFor > 5500) {
+      // V1.9：生成已经结束、chat/completion 不再 pending 后，不再额外硬等 5~7 秒。
+      // api-raw 已到手时只需极短稳定期；普通 DOM/网络候选也只确认约 1 秒，随后立刻进入同会话复检。
+      const fastRawReady = apiRawCandidates.length > 0 && !apiPending;
+      const requiredStableMs = fastRawReady ? 450 : 900;
+      const requiredVisibleMs = fastRawReady ? 250 : 700;
+      if (totalCandidates && !snapshot.generating && !apiPending
+        && stableFor >= requiredStableMs && visibleFor >= requiredVisibleMs) {
+        this.onProgress('生成结果已就绪，立即进入残留复检');
         return [...apiRawCandidates, ...latestDomCandidates, ...generatedNetworkCandidates];
       }
 
@@ -1305,7 +1311,7 @@ class DoubaoAutomation {
       if (!totalCandidates && idleSince && Date.now() - started > 90_000 && Date.now() - idleSince > 45_000) {
         throw noImageGeneratedError(snapshot.assistantTailText || snapshot.tailText, promptText);
       }
-      await sleep(1400);
+      await sleep(450);
     }
 
     const fallbackNetworkCandidates = [...networkCapture.candidates.values()].filter((candidate) =>
@@ -1347,13 +1353,9 @@ class DoubaoAutomation {
       await this.enterPrompt(prompt);
       await this.waitForVerificationIfNeeded();
       await this.sendPrompt();
-      // 新会话的 ID 要等首条消息发出后才出现在 URL 里，稍等片刻再读取
+      // 会话 ID 不再挡在生成检测前面。先等图片，一旦生成完成就立刻进入后续流程；
+      // 此时 URL 通常早已带上会话 ID，再读取一次即可，省掉最多 3 秒前置等待。
       let capturedConversationId = conversationId;
-      for (let attempt = 0; attempt < 6 && !capturedConversationId; attempt += 1) {
-        await sleep(500);
-        const url = await runInPage(this.webContents, () => location.href).catch(() => '');
-        capturedConversationId = conversationIdFromUrl(url);
-      }
       try {
         const candidates = await this.waitForGeneratedImage(baselineUrls, capture, undefined, {
           baselineFinishedReplies: Number(baseline.finishedReplies) || 0,
@@ -1363,9 +1365,18 @@ class DoubaoAutomation {
           noImageGraceMs: imageWaitSeconds > 0 ? imageWaitSeconds * 1000 : DEFAULT_NO_IMAGE_GRACE_MS,
           apiRawCapture
         });
+        if (!capturedConversationId) {
+          const url = await runInPage(this.webContents, () => location.href).catch(() => '');
+          capturedConversationId = conversationIdFromUrl(url);
+        }
         // apiRawHit 供调用方决定是否需要「加隔离带重发」的降级轮
         const apiRawHit = candidates.some((candidate) => candidate.source === 'api-raw');
-        return { candidates, conversationId: capturedConversationId, apiRawHit };
+        return {
+          candidates,
+          conversationId: capturedConversationId,
+          apiRawHit,
+          generationReadyAt: Date.now()
+        };
       } catch (error) {
         if (capturedConversationId && !error.conversationId) error.conversationId = capturedConversationId;
         throw error;
@@ -1376,17 +1387,20 @@ class DoubaoAutomation {
     }
   }
 
-  async inspectLatestGeneratedResidual({ prompt, timeoutMs = 45_000 }) {
+  async inspectLatestGeneratedResidual({ prompt, timeoutMs = 45_000, skipAuthCheck = false, onDispatched = null }) {
     this.assertAlive();
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
-    await this.requireAuthenticated();
+    if (!skipAuthCheck) await this.requireAuthenticated();
 
     this.onProgress('正在当前会话直接复检上一张生成图');
     const baseline = await runInPage(this.webContents, pageImageSnapshot);
     await this.enterPrompt(prompt);
     await this.waitForVerificationIfNeeded();
     await this.sendPrompt();
+    if (typeof onDispatched === 'function') {
+      try { onDispatched(Date.now()); } catch { /* timing callback must never break audit */ }
+    }
 
     const started = Date.now();
     let lastText = '';

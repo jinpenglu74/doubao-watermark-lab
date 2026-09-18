@@ -197,7 +197,7 @@ test('图形验证消失后又弹出手机号验证：不提前判定完成，�
   assert.ok(state.verificationChecks >= 9, '完成前应有连续多轮确认');
 });
 
-test('无验证、无重启信号时：正常等到图片出现', async () => {
+test('无验证、无重启信号时：图片生成完成后约 1 秒内结束等待', async () => {
   const harness = createHarness({
     verificationPlan: noVerification,
     snapshotPlan: () => ({
@@ -209,8 +209,11 @@ test('无验证、无重启信号时：正常等到图片出现', async () => {
       assistantTailText: '图片已生成'
     })
   });
+  const started = Date.now();
   const result = await harness.automation.waitForGeneratedImage(new Set(), harness.capture, 60_000, {});
   assert.ok(result.some((item) => item.url === GENERATED_IMAGE.url));
+  assert.ok(Date.now() - started < 4_000, '图片已完成后不应再硬等 5~7 秒');
+  assert.ok(harness.progress.some((message) => message.includes('立即进入残留复检')));
 });
 
 
