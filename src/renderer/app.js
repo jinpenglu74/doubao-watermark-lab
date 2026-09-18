@@ -261,7 +261,7 @@ function progressForMessage(message, current = 0) {
   else if (/原生保存|下载/.test(text)) progress = 84;
   else if (/高清预览|高清画布|生成结果画布/.test(text)) progress = 90;
   else if (/自动定点补修/.test(text)) progress = Math.max(current, 92);
-  else if (/全图复检|残留水印/.test(text)) progress = Math.max(current, 94);
+  else if (/全图复检|同会话复检|当前会话直接复检|残留水印/.test(text)) progress = Math.max(current, 94);
   else if (/安全覆盖原图|覆盖原图/.test(text)) progress = Math.max(current, 97);
   return Math.min(96, Math.max(current, progress));
 }
@@ -397,6 +397,16 @@ function makeQueueItem(file, index) {
     flag.className = 'capture-flag is-page';
     flag.textContent = t('耗时 {n}秒', { n: (file.timings.totalMs / 1000).toFixed(1) });
     flag.title = t(file.timingSummary || '');
+    copy.append(flag);
+  }
+    if (file.status === 'complete' && file.auditMode && file.auditMode !== 'manual-skip') {
+    const flag = document.createElement('span');
+    const usedFallback = file.auditMode === 'same-conversation-with-fallback';
+    flag.className = usedFallback ? 'qc-flag' : 'capture-flag is-raw';
+    flag.textContent = usedFallback ? t('复检：同会话→回退') : t('同会话复检');
+    flag.title = usedFallback
+      ? t('优先在当前会话复检；同会话失败后才重新上传结果图兜底')
+      : t('直接检查当前会话上一张生成图，未重新上传结果图');
     copy.append(flag);
   }
     if (file.status === 'complete' && file.captureSource) {
@@ -644,6 +654,9 @@ function handleBatchEvent(event) {
         autoRepairPasses: event.autoRepairPasses || 0,
         residualAuditCount: event.residualAuditCount || 0,
         residualStatus: event.residualStatus || '',
+        sameConversationAuditCount: event.sameConversationAuditCount || 0,
+        auditFallbackCount: event.auditFallbackCount || 0,
+        auditMode: event.auditMode || '',
         timings: event.timings || null,
         timingSummary: event.timingSummary || '',
         overwroteOriginal: event.overwroteOriginal === true,

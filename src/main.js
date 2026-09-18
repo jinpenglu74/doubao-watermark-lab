@@ -16,7 +16,7 @@ const {
   saveProcessedImage,
   watermarkRegionsToStrokes
 } = require('./image-pipeline');
-const { buildManualEditPrompt, buildPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
+const { buildManualEditPrompt, buildPrompt, buildSameConversationWatermarkAuditPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
 const { overwriteGuard, replaceOriginalSafely } = require('./original-overwrite');
 const {
   MAX_AUTO_RETRIES,
@@ -1295,6 +1295,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       let autoRepairPasses = 0;
       let residualAuditCount = 0;
       let residualStatus = mode === 'manual' ? 'manual-skip' : 'checking';
+      let sameConversationAuditCount = 0;
+      let auditFallbackCount = 0;
       if (mode !== 'manual') {
         const maxAutoRepairPasses = 2;
         for (let auditIndex = 0; auditIndex <= maxAutoRepairPasses; auditIndex += 1) {
@@ -1307,11 +1309,33 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               message: `正在全图复检残留水印（${residualAuditCount}/${maxAutoRepairPasses + 1}）`
             });
             const auditStarted = Date.now();
-            audit = await automation.inspectWatermarkResidual({
-              filePath: saved.path,
-              prompt: buildWatermarkAuditPrompt(settings),
-              timeoutMs: 90_000
-            });
+            try {
+              audit = await automation.inspectLatestGeneratedResidual({
+                prompt: buildSameConversationWatermarkAuditPrompt(settings),
+                timeoutMs: 45_000
+              });
+              sameConversationAuditCount += 1;
+              batchEvent({
+                type: 'job-progress',
+                ...jobBase,
+                message: '同会话复检完成：未重新上传处理结果'
+              });
+            } catch (sameAuditError) {
+              if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(sameAuditError.code) || isDestroyedObjectError(sameAuditError)) {
+                throw sameAuditError;
+              }
+              auditFallbackCount += 1;
+              batchEvent({
+                type: 'job-progress',
+                ...jobBase,
+                message: `同会话复检未完成：${sameAuditError.message || sameAuditError}；正在回退到重新上传复检`
+              });
+              audit = await automation.inspectWatermarkResidual({
+                filePath: saved.path,
+                prompt: buildWatermarkAuditPrompt(settings),
+                timeoutMs: 90_000
+              });
+            }
             timings.auditMs += Date.now() - auditStarted;
           } catch (auditError) {
             if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(auditError.code) || isDestroyedObjectError(auditError)) {
@@ -1383,10 +1407,11 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             });
 
             const repairPrompt = buildManualEditPrompt(settings);
+            // 补修也优先留在当前图片自己的会话里，避免每轮再创建新对话。
             const repairFirstPass = await automation.processImage({
               filePath: markedUpload.path,
               prompt: repairPrompt,
-              newConversation: true,
+              newConversation: false,
               conversationId: '',
               imageWaitSeconds: settings.imageWaitSeconds
             });
@@ -1407,8 +1432,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               const repairSecondPass = await automation.processImage({
                 filePath: repairUploadPath,
                 prompt: repairPrompt,
-                newConversation: true,
-                conversationId: repairFirstPass.conversationId || '',
+                newConversation: false,
+                conversationId: '',
                 imageWaitSeconds: settings.imageWaitSeconds
               });
               repairCandidates = repairSecondPass.candidates;
@@ -1570,6 +1595,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         `复检 ${seconds(timings.auditMs)}秒`,
         timings.repairMs > 0 ? `补修 ${seconds(timings.repairMs)}秒` : '',
         settings.overwriteOriginal ? `质检 ${seconds(timings.qcMs)}秒` : '质检 后台',
+        mode === 'manual'
+          ? '复检模式 手动跳过'
+          : `复检模式 同会话${auditFallbackCount > 0 ? `/回退${auditFallbackCount}次` : ''}`,
         `总计 ${seconds(timings.totalMs)}秒`
       ].filter(Boolean).join(' / ');
       batchEvent({ type: 'job-progress', ...jobBase, message: `本图耗时：${timingSummary}` });
@@ -1580,6 +1608,11 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         autoRepairPasses,
         residualAuditCount,
         residualStatus,
+        sameConversationAuditCount,
+        auditFallbackCount,
+        auditMode: mode === 'manual'
+          ? 'manual-skip'
+          : (auditFallbackCount > 0 ? 'same-conversation-with-fallback' : 'same-conversation'),
         timings,
         timingSummary,
         overwroteOriginal,
