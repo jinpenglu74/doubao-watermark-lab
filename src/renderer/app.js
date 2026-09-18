@@ -399,6 +399,16 @@ function makeQueueItem(file, index) {
     flag.title = t(file.timingSummary || '');
     copy.append(flag);
   }
+    if (file.status === 'complete' && file.auditMode && file.auditMode !== 'manual-skip') {
+    const flag = document.createElement('span');
+    const usedFallback = file.auditMode === 'same-conversation-with-fallback';
+    flag.className = usedFallback ? 'qc-flag' : 'capture-flag is-raw';
+    flag.textContent = usedFallback ? t('复检：同会话→回退') : t('同会话复检');
+    flag.title = usedFallback
+      ? t('优先在当前会话复检；同会话失败后才重新上传结果图兜底')
+      : t('直接检查当前会话上一张生成图，未重新上传结果图');
+    copy.append(flag);
+  }
     if (file.status === 'complete' && file.captureSource) {
     const flag = document.createElement('span');
     const isRaw = file.captureSource === 'api-raw';
@@ -644,6 +654,9 @@ function handleBatchEvent(event) {
         autoRepairPasses: event.autoRepairPasses || 0,
         residualAuditCount: event.residualAuditCount || 0,
         residualStatus: event.residualStatus || '',
+        sameConversationAuditCount: event.sameConversationAuditCount || 0,
+        auditFallbackCount: event.auditFallbackCount || 0,
+        auditMode: event.auditMode || '',
         timings: event.timings || null,
         timingSummary: event.timingSummary || '',
         overwroteOriginal: event.overwroteOriginal === true,
