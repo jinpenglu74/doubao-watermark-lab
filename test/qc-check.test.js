@@ -68,3 +68,19 @@ test('热力图：未变化区域为暗化原图，变化区域红色通道增�
   const heatmapBgra = buildHeatmap(a, b, 2, 2, 2);
   assert.deepEqual([...heatmapBgra.subarray(4, 8)], [30, 30, 235, 255]);
 });
+
+
+test('大面积低强度变化可视为平铺或半透明水印清理，不误判毁图', () => {
+  const a = makeBuffer(10000, [100, 100, 100, 255]);
+  const b = makeBuffer(10000, [100, 100, 100, 255]);
+  for (let i = 0; i < 9000; i += 1) {
+    const offset = i * 4;
+    b[offset] = 118;
+    b[offset + 1] = 118;
+    b[offset + 2] = 118;
+  }
+  const stats = computeDiffStats(a, b);
+  assert.ok(stats.changedRatio > 0.85);
+  assert.ok(stats.meanDiff < 20);
+  assert.equal(verdictForStats(stats), 'ok');
+});
