@@ -1161,10 +1161,36 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     if (taskConversationId && inUseConversations.has(taskConversationId)) taskConversationId = '';
     if (taskConversationId) inUseConversations.add(taskConversationId);
     let paddedUpload = null;
+    const taskStartedAt = Date.now();
+    const timings = {
+      firstPassMs: 0,
+      fallbackPassMs: 0,
+      downloadSaveMs: 0,
+      auditMs: 0,
+      repairMs: 0,
+      qcMs: 0,
+      totalMs: 0
+    };
+    let qcPromise = null;
+    let qcTargetPath = '';
+    const launchQc = (targetPath) => {
+      const started = Date.now();
+      qcTargetPath = targetPath;
+      // 延后一拍启动，让网络型残留复检先进入 await；QC 的本地 CPU 工作随后利用等待时间完成，
+      // 避免在开始复检前先同步卡住主进程。
+      return new Promise((resolve) => {
+        setImmediate(() => {
+          runQcCheck(sourcePath, targetPath)
+            .then((qc) => resolve({ qc, error: null, elapsedMs: Date.now() - started }))
+            .catch((error) => resolve({ qc: null, error, elapsedMs: Date.now() - started }));
+        });
+      });
+    };
     try {
       const promptText = runtime.prompt || buildPrompt(settings);
       // 第一轮：原图直发（不加隔离带、不做任何加工），尝试从接口拦截无水印原图；
       // 命中即不裁切直接导出
+      const firstPassStarted = Date.now();
       const firstPass = await automation.processImage({
         filePath: file.path,
         prompt: promptText,
@@ -1174,6 +1200,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         conversationId: taskConversationId,
         imageWaitSeconds: settings.imageWaitSeconds
       });
+      timings.firstPassMs += Date.now() - firstPassStarted;
       let candidates = firstPass.candidates;
       let conversationId = firstPass.conversationId;
       let uploadPath = file.path;
@@ -1195,6 +1222,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           edge: settings.cropEdge
         });
         uploadPath = paddedUpload.path;
+        const fallbackPassStarted = Date.now();
         const secondPass = await automation.processImage({
           filePath: uploadPath,
           prompt: promptText,
@@ -1202,9 +1230,11 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           conversationId: conversationId || taskConversationId,
           imageWaitSeconds: settings.imageWaitSeconds
         });
+        timings.fallbackPassMs += Date.now() - fallbackPassStarted;
         candidates = secondPass.candidates;
         conversationId = secondPass.conversationId || conversationId;
       }
+      const downloadSaveStarted = Date.now();
       let candidate;
       try {
         candidate = await downloadBestImage({
@@ -1254,6 +1284,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         settings,
         paddedUpload
       });
+      timings.downloadSaveMs += Date.now() - downloadSaveStarted;
+
+      // 本地像素 QC 与豆包残留复检并行。正常结果只做快速像素比较，不再生成热力图。
+      qcPromise = launchQc(saved.path);
 
       // 通用残留水印闭环：不依赖固定位置、颜色、语言或某一种 Logo。
       // 先让视觉模型全图复检并返回归一化区域；只对高置信区域自动打粉色遮罩做定点补修，
@@ -1272,11 +1306,13 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               ...jobBase,
               message: `正在全图复检残留水印（${residualAuditCount}/${maxAutoRepairPasses + 1}）`
             });
+            const auditStarted = Date.now();
             audit = await automation.inspectWatermarkResidual({
               filePath: saved.path,
               prompt: buildWatermarkAuditPrompt(settings),
               timeoutMs: 90_000
             });
+            timings.auditMs += Date.now() - auditStarted;
           } catch (auditError) {
             if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(auditError.code) || isDestroyedObjectError(auditError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
@@ -1296,15 +1332,20 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             break;
           }
 
+          // 第一轮允许 0.62 以上的高置信残留自动补修；第一轮补修后，
+          // 第二轮只处理 >=0.82 的明确残留，避免为了低置信疑点再跑一整轮豆包生成。
+          const minRepairConfidence = autoRepairPasses > 0 ? 0.82 : 0.62;
           const repairRegions = (Array.isArray(audit.regions) ? audit.regions : [])
-            .filter((region) => Number(region.confidence) >= 0.62)
+            .filter((region) => Number(region.confidence) >= minRepairConfidence)
             .slice(0, 48);
           if (!repairRegions.length) {
             residualStatus = 'review';
             batchEvent({
               type: 'job-progress',
               ...jobBase,
-              message: '检测到低置信度疑似标记，为避免误删真实场景文字，已保留当前结果供人工确认'
+              message: autoRepairPasses > 0
+                ? '第一轮补修后仅剩低置信度疑似残留，已停止继续生成并保留结果供人工确认'
+                : '检测到低置信度疑似标记，为避免误删真实场景文字，已保留当前结果供人工确认'
             });
             break;
           }
@@ -1326,6 +1367,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
 
           let markedUpload = null;
           let repairPadding = null;
+          const repairStarted = Date.now();
           try {
             batchEvent({
               type: 'job-progress',
@@ -1418,6 +1460,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             saved = repaired;
             autoRepairPasses += 1;
             residualStatus = 'repaired-pending-audit';
+            // 初始结果的并行 QC 已经过期，最终只需要对最新补修结果再做一次。
+            qcPromise = null;
+            qcTargetPath = '';
           } catch (repairError) {
             if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(repairError.code) || isDestroyedObjectError(repairError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
@@ -1431,6 +1476,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             });
             break;
           } finally {
+            timings.repairMs += Date.now() - repairStarted;
             if (markedUpload?.directory) {
               await fs.rm(markedUpload.directory, { recursive: true, force: true }).catch(() => {});
             }
@@ -1441,16 +1487,23 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         }
       }
 
-      // 最终像素质检必须在覆盖原图之前完成；只有“残留复检通过 + 像素质检正常”才允许替换。
+      // QC 已和第一次残留复检并行启动。只有开启“覆盖原图”时才同步等待，
+      // 因为此时 QC 是允许覆盖的安全门；普通保存模式则先完成任务，QC 在后台补回结果。
+      if (!qcPromise || qcTargetPath !== saved.path) qcPromise = launchQc(saved.path);
       let finalQc = null;
-      try {
-        finalQc = await runQcCheck(sourcePath, saved.path);
-      } catch (qcError) {
-        batchEvent({
-          type: 'job-progress',
-          ...jobBase,
-          message: `最终质检未完成：${qcError.message || qcError}；不会覆盖原图`
-        });
+      let finalQcError = null;
+      if (settings.overwriteOriginal) {
+        const qcOutcome = await qcPromise;
+        timings.qcMs = qcOutcome.elapsedMs || 0;
+        finalQc = qcOutcome.qc;
+        finalQcError = qcOutcome.error;
+        if (finalQcError) {
+          batchEvent({
+            type: 'job-progress',
+            ...jobBase,
+            message: `最终质检未完成：${finalQcError.message || finalQcError}；不会覆盖原图`
+          });
+        }
       }
 
       let overwriteStatus = settings.overwriteOriginal ? 'blocked-qc' : 'disabled';
@@ -1509,12 +1562,26 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         batchEvent({ type: 'job-progress', ...jobBase, message: reasonMessage });
       }
 
+      timings.totalMs = Date.now() - taskStartedAt;
+      const seconds = (ms) => (Math.max(0, Number(ms) || 0) / 1000).toFixed(1);
+      const timingSummary = [
+        `首次处理 ${seconds(timings.firstPassMs)}秒`,
+        timings.fallbackPassMs > 0 ? `降级重发 ${seconds(timings.fallbackPassMs)}秒` : '',
+        `复检 ${seconds(timings.auditMs)}秒`,
+        timings.repairMs > 0 ? `补修 ${seconds(timings.repairMs)}秒` : '',
+        settings.overwriteOriginal ? `质检 ${seconds(timings.qcMs)}秒` : '质检 后台',
+        `总计 ${seconds(timings.totalMs)}秒`
+      ].filter(Boolean).join(' / ');
+      batchEvent({ type: 'job-progress', ...jobBase, message: `本图耗时：${timingSummary}` });
+
       const result = {
         ...jobBase,
         ...saved,
         autoRepairPasses,
         residualAuditCount,
         residualStatus,
+        timings,
+        timingSummary,
         overwroteOriginal,
         overwriteStatus,
         ...(refreshedSource ? { refreshedSource } : {}),
@@ -1525,8 +1592,23 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       };
       results.push(result);
       batchEvent({ type: 'job-complete', ...result });
-      if (finalQc) {
-        batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc });
+      if (settings.overwriteOriginal) {
+        if (finalQc) {
+          batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc, qcElapsedMs: timings.qcMs });
+        }
+      } else {
+        // 不开启覆盖原图时，不再让本地 QC 阻塞“完成”。QC 结束后只补发质检事件。
+        const backgroundOutputPath = saved.path;
+        qcPromise.then((qcOutcome) => {
+          if (!qcOutcome?.qc) return;
+          batchEvent({
+            type: 'job-qc',
+            ...jobBase,
+            outputPath: backgroundOutputPath,
+            qc: qcOutcome.qc,
+            qcElapsedMs: qcOutcome.elapsedMs || 0
+          });
+        }).catch(() => {});
       }
     } catch (error) {
       error = normalizeTaskError(error);
@@ -1856,7 +1938,7 @@ async function runManualEdit(payload = {}) {
 // 自动质检：对比原图与处理结果，识别"疑似未处理 / 差异过大"并生成差异热力图。
 // 无额外图像依赖：用 nativeImage 解码，统一缩到相同尺寸（≤512）后逐像素比较；
 // 热力图按输出路径命名（同名覆盖，不会越积越多），存于 userData/qc。
-async function runQcCheck(sourcePath, outputPath) {
+async function runQcCheck(sourcePath, outputPath, { forceHeatmap = false } = {}) {
   const sourceImage = nativeImage.createFromPath(sourcePath);
   const outputImage = nativeImage.createFromPath(outputPath);
   if (sourceImage.isEmpty() || outputImage.isEmpty()) throw new Error('质检图片读取失败');
@@ -1870,6 +1952,10 @@ async function runQcCheck(sourcePath, outputPath) {
   const outputPixels = outputImage.resize({ width, height, quality: 'good' }).toBitmap();
   const stats = computeDiffStats(sourcePixels, outputPixels);
   const verdict = verdictForStats(stats);
+
+  // 正常图片不再生成/写入热力图；只有异常结果或明确要求时才做额外 I/O。
+  if (verdict === 'ok' && !forceHeatmap) return { verdict, ...stats, heatmapPath: '' };
+
   const heatmapPixels = buildHeatmap(sourcePixels, outputPixels, width, height, 2);
   const heatmap = nativeImage.createFromBitmap(heatmapPixels, { width, height });
   const directory = path.join(app.getPath('userData'), 'qc');

@@ -17,6 +17,11 @@ const VERIFICATION_SUCCESS_PATTERN = /验证(?:成功|通过|已完成)|已(?:�
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+function settledNoImageGraceMs(noImageGraceMs, sawReplyFinished) {
+  const requested = Math.max(1_000, Number(noImageGraceMs) || DEFAULT_NO_IMAGE_GRACE_MS);
+  return sawReplyFinished ? Math.min(requested, 20_000) : requested;
+}
+
 function assertNotCancelled(isCancelled) {
   if (isCancelled?.()) {
     const error = new Error('批处理已取消');
@@ -771,6 +776,8 @@ class DoubaoAutomation {
     this.onProgress = options.onProgress || (() => {});
     this.onVerificationRequired = options.onVerificationRequired || null;
     this.onVerificationCleared = options.onVerificationCleared || null;
+    this.lastAuthenticatedAt = 0;
+    this.lastAuthenticatedStatus = null;
   }
 
   assertAlive() {
@@ -830,9 +837,19 @@ class DoubaoAutomation {
     return { ...(last || classifyLoginState({}, false)), confirmed: false, checks: total };
   }
 
-  async requireAuthenticated() {
+  async requireAuthenticated({ force = false, maxAgeMs = 15_000 } = {}) {
+    if (!force && this.lastAuthenticatedStatus
+      && Date.now() - this.lastAuthenticatedAt <= maxAgeMs) {
+      return this.lastAuthenticatedStatus;
+    }
     const status = await this.confirmLoginStatus({ attempts: 3 });
-    if (status.state === 'authenticated') return status;
+    if (status.state === 'authenticated') {
+      this.lastAuthenticatedAt = Date.now();
+      this.lastAuthenticatedStatus = status;
+      return status;
+    }
+    this.lastAuthenticatedAt = 0;
+    this.lastAuthenticatedStatus = null;
     const error = new Error('豆包登录状态需要恢复');
     error.code = 'LOGIN_RECOVERY_REQUIRED';
     error.authStatus = status;
@@ -1271,14 +1288,16 @@ class DoubaoAutomation {
         const replySettled = sawReplyFinished || ((sawGenerating || sawStreaming) && tailQuietMs > 4_000);
         if (replySettled && !generationDoneSince) {
           generationDoneSince = Date.now();
-          this.onProgress(`豆包回复已结束，继续等待图片出现（最长 ${Math.round(noImageGraceMs / 1000)} 秒）`);
+          const settledGraceMs = settledNoImageGraceMs(noImageGraceMs, sawReplyFinished);
+          this.onProgress(`豆包回复已结束，继续等待图片出现（最长 ${Math.round(settledGraceMs / 1000)} 秒）`);
         }
       }
 
-      if (!totalCandidates && !pendingImageCount && generationDoneSince && Date.now() - generationDoneSince > noImageGraceMs) {
+      const settledGraceMs = settledNoImageGraceMs(noImageGraceMs, sawReplyFinished);
+      if (!totalCandidates && !pendingImageCount && generationDoneSince && Date.now() - generationDoneSince > settledGraceMs) {
         throw noImageGeneratedError(snapshot.assistantTailText || snapshot.tailText, promptText);
       }
-      if (!totalCandidates && Date.now() - started > 35_000 && /抱歉|无法处理|不能完成|未能生成/.test(snapshot.tailText)) {
+      if (!totalCandidates && Date.now() - started > 10_000 && /抱歉|无法处理|不能完成|未能生成/.test(snapshot.tailText)) {
         const textOnlyError = new Error('豆包返回了文字提示，但没有生成图片；可调整提示词后重试');
         textOnlyError.code = 'NO_IMAGE_GENERATED';
         throw textOnlyError;
@@ -1312,7 +1331,7 @@ class DoubaoAutomation {
     // 历史对话接不上（已删除等）时也开新对话，避免内容发进无关会话
     if (!resumed && (newConversation || conversationId)) await this.freshConversation();
     // 导航后再快速确认一次，覆盖“打开历史会话时刚好跳登录页”的边界情况。
-    await this.requireAuthenticated();
+    await this.requireAuthenticated({ force: true });
 
     await this.attachFile(filePath);
     // 上传完成后再填提示词：实测豆包在传图期间向输入框写入文字可能触发重渲染、冲掉未完成的附件
@@ -1363,7 +1382,7 @@ class DoubaoAutomation {
     await this.waitForVerificationIfNeeded();
     await this.requireAuthenticated();
     await this.freshConversation();
-    await this.requireAuthenticated();
+    await this.requireAuthenticated({ force: true });
 
     this.onProgress('正在全图复检残留水印');
     await this.attachFile(filePath);
