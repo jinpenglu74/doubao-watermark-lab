@@ -662,6 +662,16 @@ function isDoubaoWorkerUsable(browserWindow) {
   return Boolean(contents && !browserWindow.__workerDead && !browserWindow.__workerUnresponsive);
 }
 
+function doubaoWorkerSession(browserWindow) {
+  const contents = safeWebContents(browserWindow);
+  if (!contents) throw workerDestroyedError();
+  try {
+    return contents.session;
+  } catch (error) {
+    throw normalizeTaskError(error);
+  }
+}
+
 function windowUsesDoubaoSession(browserWindow, persistentSession) {
   const contents = safeWebContents(browserWindow);
   if (!contents) return false;
@@ -1111,8 +1121,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       // 进度同时打到豆包窗口标题：开着调试窗口时能直接看到当前进行到哪一步，不再像卡住
       onProgress: (message) => {
         batchEvent({ type: 'job-progress', ...jobBase, message });
-        if (workerWindow && !workerWindow.isDestroyed()) {
-          workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`);
+        if (isDoubaoWorkerUsable(workerWindow)) {
+          try { workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`); } catch {}
         }
       },
       // 返回 false = 已有其他窗口在验证（本任务是跟随者）：不弹窗，静默等待领头完成后自动重跑。
@@ -1140,7 +1150,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         verificationEpoch.value += 1;
         batchEvent({ type: 'verification-cleared', ...jobBase });
         if (!settings.showBrowserWindow) {
-          if (workerWindow && !workerWindow.isDestroyed()) workerWindow.hide();
+          if (isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
           hideIdleDoubaoWindows();
         }
       }
@@ -1199,7 +1209,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       try {
         candidate = await downloadBestImage({
           candidates,
-          electronSession: workerWindow.webContents.session,
+          electronSession: doubaoWorkerSession(workerWindow),
           nativeImage,
           preferOriginal: settings.preferOriginal,
           onProgress: (message) => {
@@ -1366,7 +1376,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             try {
               repairCandidate = await downloadBestImage({
                 candidates: repairCandidates,
-                electronSession: workerWindow.webContents.session,
+                electronSession: doubaoWorkerSession(workerWindow),
                 nativeImage,
                 preferOriginal: settings.preferOriginal,
                 onProgress: (message) => batchEvent({ type: 'job-progress', ...jobBase, message })
