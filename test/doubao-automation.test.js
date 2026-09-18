@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { conversationIdFromUrl, imageAssetKey, noImageGeneratedError, parseWatermarkAudit, responseHeader } = require('../src/doubao-automation');
+const { classifyLoginState, conversationIdFromUrl, imageAssetKey, noImageGeneratedError, parseWatermarkAudit, responseHeader } = require('../src/doubao-automation');
 
 test('解析新版 Electron 的响应头对象', () => {
   assert.equal(responseHeader({
@@ -98,4 +98,49 @@ test('残留水印复检对 clean JSON 返回空区域', () => {
 
 test('残留水印复检遇到非 JSON 文本返回 null，不误触发自动补修', () => {
   assert.equal(parseWatermarkAudit('这张图看起来已经没有水印了'), null);
+});
+
+
+test('登录判断优先相信可实际聊天/上传能力，不再要求头像必须出现', () => {
+  const composerOnly = classifyLoginState({
+    hasLogin: false,
+    hasAccount: false,
+    hasComposer: true,
+    hasUpload: false,
+    isChatUrl: true,
+    url: 'https://www.doubao.com/chat/'
+  }, false);
+  assert.equal(composerOnly.state, 'authenticated');
+  assert.equal(composerOnly.loggedIn, true);
+
+  const uploadOnly = classifyLoginState({
+    hasLogin: false,
+    hasAccount: false,
+    hasComposer: false,
+    hasUpload: true,
+    isChatUrl: true,
+    url: 'https://www.doubao.com/chat/'
+  }, false);
+  assert.equal(uploadOnly.state, 'authenticated');
+});
+
+test('明确登录入口且没有聊天能力时判定为退出，即使残留 Cookie 仍存在', () => {
+  const status = classifyLoginState({
+    hasLogin: true,
+    hasAccount: false,
+    hasComposer: false,
+    hasUpload: false,
+    isChatUrl: true,
+    isLoginPage: false,
+    url: 'https://www.doubao.com/chat/'
+  }, true);
+  assert.equal(status.state, 'logged-out');
+  assert.equal(status.loggedIn, false);
+});
+
+test('只有 Cookie、页面信号缺失时保持 uncertain，交给恢复流程复查而不是直接判失败', () => {
+  const status = classifyLoginState({}, true);
+  assert.equal(status.state, 'uncertain');
+  assert.equal(status.loggedIn, false);
+  assert.equal(status.cookieHint, true);
 });
