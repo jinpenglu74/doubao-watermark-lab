@@ -174,17 +174,18 @@ function parseWatermarkAudit(text) {
   }
   if (!payload || typeof payload !== 'object') return null;
   const confidence = clamp01(payload.confidence ?? payload.score);
-  const safeConfidence = confidence === null ? 0 : confidence;
   const rawRegions = Array.isArray(payload.regions)
     ? payload.regions
     : Array.isArray(payload.boxes)
       ? payload.boxes
       : [];
+  const explicit = payload.hasResidual ?? payload.has_residual ?? payload.residual;
+  const provisionalHasResidual = typeof explicit === 'boolean' ? explicit : rawRegions.length > 0;
+  const safeConfidence = confidence === null ? (provisionalHasResidual ? 0.75 : 0) : confidence;
   const regions = rawRegions
     .slice(0, 48)
     .map((region) => normalizeAuditRegion(region, safeConfidence))
     .filter(Boolean);
-  const explicit = payload.hasResidual ?? payload.has_residual ?? payload.residual;
   const hasResidual = typeof explicit === 'boolean' ? explicit : regions.length > 0;
   return {
     hasResidual,
