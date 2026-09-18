@@ -261,7 +261,7 @@ function progressForMessage(message, current = 0) {
   else if (/原生保存|下载/.test(text)) progress = 84;
   else if (/高清预览|高清画布|生成结果画布/.test(text)) progress = 90;
   else if (/自动定点补修/.test(text)) progress = Math.max(current, 92);
-  else if (/全图复检|残留水印/.test(text)) progress = Math.max(current, 94);
+  else if (/全图复检|同会话复检|当前会话直接复检|残留水印/.test(text)) progress = Math.max(current, 94);
   else if (/安全覆盖原图|覆盖原图/.test(text)) progress = Math.max(current, 97);
   return Math.min(96, Math.max(current, progress));
 }
