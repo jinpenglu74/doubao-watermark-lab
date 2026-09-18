@@ -1227,10 +1227,21 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     ? sanitizeSettings(rawSettings)
     : await saveSettings(rawSettings);
   const useParallel = mode !== 'manual' && settings.parallelProcessing && files.length > 1;
-  const windows = await acquireBatchWindows(useParallel ? Math.min(settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT, files.length) : 1, {
-    show: settings.showBrowserWindow
-  });
-  const workerSlots = windows.map((window, position) => ({ window, position }));
+  const configuredPoolSize = settings.parallelProcessing
+    ? (settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT)
+    : 1;
+  const windows = await acquireBatchWindows(
+    useParallel ? Math.min(configuredPoolSize, files.length) : 1,
+    {
+      show: settings.showBrowserWindow,
+      poolSize: configuredPoolSize,
+      cancelRef
+    }
+  );
+  const workerSlots = windows.map((window, index) => ({
+    window,
+    position: workerPoolState(window, index)?.position ?? index
+  }));
   const browser = workerSlots[0]?.window || null;
   const releaseWindows = () => workerSlots.forEach((slot) => {
     const window = slot.window;
@@ -1286,6 +1297,12 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       onVerificationRequired: () => {
         if (verificationGate.owner && verificationGate.owner !== verificationToken) return false;
         verificationGate.owner = verificationToken;
+        const risk = registerVerificationRisk();
+        batchEvent({
+          type: 'job-progress',
+          ...jobBase,
+          message: `检测到安全验证，已进入低验证调度模式（风险等级 ${risk.level}/3）`
+        });
         const focusTarget = isDoubaoWorkerUsable(workerWindow)
           ? workerWindow
           : (isDoubaoWorkerUsable(browser) ? browser : null);
@@ -1304,6 +1321,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         if (verificationGate.owner !== verificationToken) return;
         verificationGate.owner = null;
         verificationEpoch.value += 1;
+        clearVerificationRisk();
         batchEvent({ type: 'verification-cleared', ...jobBase });
         if (!settings.showBrowserWindow) {
           if (isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
@@ -1312,10 +1330,35 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       }
     });
 
-    let taskConversationId = typeof file.conversationId === 'string' ? file.conversationId : '';
-    // 同一会话不能被两个任务同时使用（无论并行任务还是并发批次），后来的任务另起新会话
+    // V2.0 普通批量任务不再按“图片历史会话”跳来跳去，而是固定复用所属 worker 当前聊天。
+    // 手动局部重绘仍可接回该图片历史会话，避免破坏已有编辑链。
+    let taskConversationId = mode === 'manual' && typeof file.conversationId === 'string'
+      ? file.conversationId
+      : '';
     if (taskConversationId && inUseConversations.has(taskConversationId)) taskConversationId = '';
     if (taskConversationId) inUseConversations.add(taskConversationId);
+
+    const conversationPlan = mode === 'manual'
+      ? { rotate: true, reason: 'manual', state: workerPoolState(workerWindow) }
+      : planWorkerConversation(workerWindow);
+    const poolState = conversationPlan.state || workerPoolState(workerWindow);
+    if (mode !== 'manual') {
+      const workerNumber = (Number(poolState?.position) || 0) + 1;
+      const reasonText = conversationPlan.reason === 'image-limit'
+        ? `已处理 ${CONVERSATION_IMAGE_LIMIT} 张`
+        : conversationPlan.reason === 'time-limit'
+          ? '当前聊天已使用约 15 分钟'
+          : conversationPlan.reason === 'forced'
+            ? '上次会话需要重置'
+            : '工作窗口首次使用';
+      batchEvent({
+        type: 'job-progress',
+        ...jobBase,
+        message: conversationPlan.rotate
+          ? `工作窗口 ${workerNumber}：${reasonText}，正在切换新聊天`
+          : `工作窗口 ${workerNumber}：继续复用当前聊天（${poolState.conversationImageCount + 1}/${CONVERSATION_IMAGE_LIMIT}）`
+      });
+    }
     let paddedUpload = null;
     const taskStartedAt = Date.now();
     const timings = {
@@ -1351,13 +1394,16 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       const firstPass = await automation.processImage({
         filePath: file.path,
         prompt: promptText,
-        // 每个任务独占一个会话：有历史会话先接回（接回失败 processImage 内会自动开新对话），
-        // 没有历史会话的一律开新对话，避免多张图串进同一会话、记录的会话 ID 互相覆盖
-        newConversation: true,
-        conversationId: taskConversationId,
+        // V2.0：普通批量任务每个 worker 最多连续处理 3 张或 15 分钟才换聊天；
+        // 单张图片内部的生成/复检/补修始终留在同一个聊天闭环。
+        newConversation: mode === 'manual' ? true : conversationPlan.rotate,
+        conversationId: mode === 'manual' ? taskConversationId : '',
         imageWaitSeconds: settings.imageWaitSeconds
       });
       timings.firstPassMs += Date.now() - firstPassStarted;
+      if (mode !== 'manual' && conversationPlan.rotate) {
+        markWorkerConversationStarted(workerWindow);
+      }
       let candidates = firstPass.candidates;
       let conversationId = firstPass.conversationId;
       let finalGenerationReadyAt = Number(firstPass.generationReadyAt) || Date.now();
@@ -1384,8 +1430,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         const secondPass = await automation.processImage({
           filePath: uploadPath,
           prompt: promptText,
-          newConversation: true,
-          conversationId: conversationId || taskConversationId,
+          newConversation: mode === 'manual',
+          conversationId: mode === 'manual' ? (conversationId || taskConversationId) : '',
           imageWaitSeconds: settings.imageWaitSeconds
         });
         timings.fallbackPassMs += Date.now() - fallbackPassStarted;
@@ -1809,6 +1855,15 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       ].filter(Boolean).join(' / ');
       batchEvent({ type: 'job-progress', ...jobBase, message: `本图耗时：${timingSummary}` });
 
+      if (mode === 'manual') {
+        resetWorkerConversationState(workerWindow, { forceRotate: true });
+      } else if (auditFallbackCount > 0) {
+        // 重新上传兜底会新建专用复检聊天，下一张图重新开一个干净聊天再进入固定复用周期。
+        resetWorkerConversationState(workerWindow, { forceRotate: true });
+      } else {
+        markWorkerImageCompleted(workerWindow);
+      }
+
       const result = {
         ...jobBase,
         ...saved,
@@ -1851,6 +1906,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         }).catch(() => {});
       }
     } catch (error) {
+      if (mode !== 'manual') {
+        const state = workerPoolState(workerWindow);
+        if (state) state.forceConversationRotate = true;
+      }
       error = normalizeTaskError(error);
       if (error.code === 'CANCELLED' || cancelRef.value) return;
       if (error.code === 'VERIFICATION_INTERRUPTED') return { kind: 'retry-verification', error };
@@ -1967,6 +2026,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         } else {
           await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
         }
+        resetWorkerConversationState(slot.window, { forceRotate: true });
         epochRef.login = loginRecoveryEpoch.value;
         epochRef.verification = verificationEpoch.value;
         batchEvent({
@@ -2000,13 +2060,20 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ]);
         }
 
+        resetWorkerConversationState(slot.window, { forceRotate: true });
         epochRef.verification = verificationEpoch.value;
         epochRef.login = loginRecoveryEpoch.value;
+        const retrySpacing = dispatchSpacingMs(verificationRisk, Date.now());
+        const retryCooldown = Math.max(0, (Number(verificationRisk.cooldownUntil) || 0) - Date.now());
+        const staggerMs = retryCooldown + Math.max(0, Number(slot.position) || 0) * retrySpacing;
         batchEvent({
           type: 'job-progress',
           ...common,
-          message: `安全验证已中断任务，正在重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
+          message: `安全验证已中断任务，低验证模式错峰 ${Math.ceil(staggerMs / 1000)} 秒后重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
         });
+        if (staggerMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, staggerMs));
+        }
         continue;
       }
 
