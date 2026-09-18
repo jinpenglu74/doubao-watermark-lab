@@ -14,6 +14,7 @@ function isDestroyedObjectError(error) {
     || /webcontents?.*(?:destroyed|disposed)/i.test(message)
     || /render(?:er)? frame.*(?:disposed|destroyed)/i.test(message)
     || /browserwindow.*destroyed/i.test(message)
+    || /豆包工作窗口已失效/.test(message)
     || /cannot call.*destroyed/i.test(message);
 }
 
