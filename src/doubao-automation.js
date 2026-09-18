@@ -125,6 +125,75 @@ function harvestSseText(text, found) {
   }
 }
 
+function clamp01(value) {
+  let number = Number(value);
+  if (!Number.isFinite(number)) return null;
+  if (number > 1 && number <= 100) number /= 100;
+  return Math.min(1, Math.max(0, number));
+}
+
+function normalizeAuditRegion(region, fallbackConfidence = 0) {
+  if (!region || typeof region !== 'object') return null;
+  let x = clamp01(region.x ?? region.left ?? region.x1);
+  let y = clamp01(region.y ?? region.top ?? region.y1);
+  let w = clamp01(region.w ?? region.width);
+  let h = clamp01(region.h ?? region.height);
+  const right = clamp01(region.right ?? region.x2);
+  const bottom = clamp01(region.bottom ?? region.y2);
+  if (w === null && x !== null && right !== null) w = Math.max(0, right - x);
+  if (h === null && y !== null && bottom !== null) h = Math.max(0, bottom - y);
+  if ([x, y, w, h].some((value) => value === null)) return null;
+  if (x + w > 1) w = Math.max(0, 1 - x);
+  if (y + h > 1) h = Math.max(0, 1 - y);
+  if (w <= 0.001 || h <= 0.001) return null;
+  const confidence = clamp01(region.confidence ?? region.score);
+  return {
+    x,
+    y,
+    w,
+    h,
+    confidence: confidence === null ? fallbackConfidence : confidence,
+    kind: typeof region.kind === 'string' ? region.kind.slice(0, 40) : ''
+  };
+}
+
+function parseWatermarkAudit(text) {
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  const unfenced = raw
+    .replace(/^\s*```(?:json)?\s*/i, '')
+    .replace(/\s*```\s*$/i, '');
+  const start = unfenced.indexOf('{');
+  const end = unfenced.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  let payload;
+  try {
+    payload = JSON.parse(unfenced.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+  if (!payload || typeof payload !== 'object') return null;
+  const confidence = clamp01(payload.confidence ?? payload.score);
+  const rawRegions = Array.isArray(payload.regions)
+    ? payload.regions
+    : Array.isArray(payload.boxes)
+      ? payload.boxes
+      : [];
+  const explicit = payload.hasResidual ?? payload.has_residual ?? payload.residual;
+  const provisionalHasResidual = typeof explicit === 'boolean' ? explicit : rawRegions.length > 0;
+  const safeConfidence = confidence === null ? (provisionalHasResidual ? 0.75 : 0) : confidence;
+  const regions = rawRegions
+    .slice(0, 48)
+    .map((region) => normalizeAuditRegion(region, safeConfidence))
+    .filter(Boolean);
+  const hasResidual = typeof explicit === 'boolean' ? explicit : regions.length > 0;
+  return {
+    hasResidual,
+    confidence: safeConfidence,
+    regions: hasResidual ? regions : []
+  };
+}
+
 function pageLoginStatus() {
   const visible = (element) => {
     const rect = element.getBoundingClientRect();
@@ -1152,6 +1221,49 @@ class DoubaoAutomation {
     }
   }
 
+  async inspectWatermarkResidual({ filePath, prompt, timeoutMs = 90_000 }) {
+    assertNotCancelled(this.isCancelled);
+    await this.waitForVerificationIfNeeded();
+    await this.freshConversation();
+    const login = await this.getLoginStatus();
+    if (!login.loggedIn) throw new Error('豆包登录状态已失效，请重新登录后继续');
+
+    this.onProgress('正在全图复检残留水印');
+    await this.attachFile(filePath);
+    await this.waitForUploadPreview();
+    await this.waitForVerificationIfNeeded();
+    const baseline = await runInPage(this.webContents, pageImageSnapshot);
+    await this.enterPrompt(prompt);
+    await this.waitForVerificationIfNeeded();
+    await this.sendPrompt();
+
+    const started = Date.now();
+    let lastText = '';
+    let stableSince = Date.now();
+    let lastParsed = null;
+    while (Date.now() - started < timeoutMs) {
+      assertNotCancelled(this.isCancelled);
+      assertNotRestarted(this.shouldRestart);
+      await this.waitForVerificationIfNeeded();
+      const snapshot = await runInPage(this.webContents, pageImageSnapshot);
+      const text = String(snapshot.assistantTailText || '').trim();
+      if (text !== lastText) {
+        lastText = text;
+        stableSince = Date.now();
+        lastParsed = parseWatermarkAudit(text);
+      }
+      const finished = Number(snapshot.finishedReplies) > Number(baseline.finishedReplies || 0)
+        || Number(snapshot.followUps) > Number(baseline.followUps || 0);
+      const settled = !snapshot.generating && (finished || Date.now() - stableSince > 2800);
+      if (settled && lastParsed) return lastParsed;
+      if (settled && text && Date.now() - stableSince > 6500) {
+        throw new Error('残留水印复检返回格式异常，未能解析检测结果');
+      }
+      await sleep(900);
+    }
+    throw new Error('残留水印复检超时');
+  }
+
   async downloadGeneratedFromEditor(nativeImage, timeoutMs = 60_000) {
     const temporaryPath = path.join(os.tmpdir(), `watermark-lab-${Date.now()}-${crypto.randomUUID()}.png`);
     let activeItem = null;
@@ -1296,6 +1408,7 @@ module.exports = {
   harvestSseText,
   imageAssetKey,
   noImageGeneratedError,
+  parseWatermarkAudit,
   pageLoginStatus,
   pageVerificationState,
   responseHeader

@@ -10,7 +10,8 @@ const {
   isExactSourceImage,
   paddingPixelsForPercent,
   paintManualMaskOnBitmap,
-  restoreOriginalAspectRectangle
+  restoreOriginalAspectRectangle,
+  watermarkRegionsToStrokes
 } = require('../src/image-pipeline');
 
 test('top crop removes pixels from the top edge', () => {
@@ -82,4 +83,30 @@ test('keeps a generated candidate whose bytes differ from the source file', asyn
   await fs.writeFile(sourcePath, Buffer.from('uploaded-image'));
 
   assert.equal(await isExactSourceImage({ buffer: Buffer.from('generated-image') }, sourcePath), false);
+});
+
+
+test('watermark regions become bounded zig-zag strokes for arbitrary image positions', () => {
+  const strokes = watermarkRegionsToStrokes([
+    { x: 0.02, y: 0.03, w: 0.12, h: 0.06 },
+    { x: 0.35, y: 0.62, w: 0.44, h: 0.08 },
+    { x: 0.91, y: 0.88, w: 0.12, h: 0.10 }
+  ], { brushPercent: 3 });
+  assert.equal(strokes.length, 3);
+  for (const stroke of strokes) {
+    assert.ok(stroke.length >= 2);
+    for (const point of stroke) {
+      assert.ok(point.x >= 0 && point.x <= 1);
+      assert.ok(point.y >= 0 && point.y <= 1);
+    }
+  }
+});
+
+test('watermark region conversion ignores invalid zero-size regions', () => {
+  const strokes = watermarkRegionsToStrokes([
+    { x: 0.2, y: 0.2, w: 0, h: 0.1 },
+    { x: 0.2, y: 0.2, w: 0.1, h: 0 },
+    { x: 0.2, y: 0.2, w: 0.1, h: 0.1 }
+  ]);
+  assert.equal(strokes.length, 1);
 });

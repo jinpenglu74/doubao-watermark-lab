@@ -247,6 +247,47 @@ function paintManualMaskOnBitmap(bitmap, width, height, strokes, brushPercent = 
   return output;
 }
 
+function watermarkRegionsToStrokes(regions, options = {}) {
+  const brushPercent = Math.min(8, Math.max(1.5, Number(options.brushPercent) || 3));
+  const normalized = (Array.isArray(regions) ? regions : [])
+    .slice(0, 48)
+    .map((region) => ({
+      x: Math.min(1, Math.max(0, Number(region?.x) || 0)),
+      y: Math.min(1, Math.max(0, Number(region?.y) || 0)),
+      w: Math.min(1, Math.max(0, Number(region?.w) || 0)),
+      h: Math.min(1, Math.max(0, Number(region?.h) || 0))
+    }))
+    .filter((region) => region.w > 0.001 && region.h > 0.001);
+
+  const strokes = [];
+  for (const region of normalized) {
+    const margin = Math.min(0.04, Math.max(0.008, Math.max(region.w, region.h) * 0.12));
+    const left = Math.max(0, region.x - margin);
+    const top = Math.max(0, region.y - margin);
+    const right = Math.min(1, region.x + region.w + margin);
+    const bottom = Math.min(1, region.y + region.h + margin);
+    const step = Math.max(0.008, Math.min(0.025, brushPercent / 180));
+    const stroke = [];
+    let row = 0;
+    for (let y = top; y <= bottom + 0.0001; y += step) {
+      const clampedY = Math.min(bottom, y);
+      if (row % 2 === 0) {
+        stroke.push({ x: left, y: clampedY }, { x: right, y: clampedY });
+      } else {
+        stroke.push({ x: right, y: clampedY }, { x: left, y: clampedY });
+      }
+      row += 1;
+      if (clampedY >= bottom) break;
+    }
+    if (stroke.length < 2) {
+      const centerY = Math.min(1, Math.max(0, (top + bottom) / 2));
+      stroke.push({ x: left, y: centerY }, { x: right, y: centerY });
+    }
+    strokes.push(stroke);
+  }
+  return strokes.slice(0, 120);
+}
+
 async function prepareManualMarkedUpload({
   sourcePath,
   nativeImage,
@@ -403,6 +444,7 @@ module.exports = {
   paintManualMaskOnBitmap,
   prepareManualMarkedUpload,
   preparePaddedUpload,
+  watermarkRegionsToStrokes,
   restoreOriginalAspectRectangle,
   saveProcessedImage,
   shouldCrop

@@ -13,9 +13,10 @@ const {
   isExactSourceImage,
   prepareManualMarkedUpload,
   preparePaddedUpload,
-  saveProcessedImage
+  saveProcessedImage,
+  watermarkRegionsToStrokes
 } = require('./image-pipeline');
-const { buildManualEditPrompt, buildPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
+const { buildManualEditPrompt, buildPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
 const { writeZipFile } = require('./zip-writer');
 
 const DOUBAO_PARTITION = 'persist:watermark-lab-doubao';
@@ -285,6 +286,12 @@ function sanitizeQueueRecord(record = {}) {
     cropPercent: Math.max(0, Number(record.cropPercent) || 0),
     cropEdge: record.cropEdge === 'bottom' ? 'bottom' : 'top',
     removedUploadPadding: Boolean(record.removedUploadPadding),
+    autoRepairPasses: Math.min(2, Math.max(0, Math.round(Number(record.autoRepairPasses) || 0))),
+    residualAuditCount: Math.min(3, Math.max(0, Math.round(Number(record.residualAuditCount) || 0))),
+    residualStatus: [
+      'manual-skip', 'checking', 'clean', 'repaired-clean', 'review',
+      'residual-after-max', 'audit-failed', 'repair-failed', 'repaired-pending-audit'
+    ].includes(record.residualStatus) ? record.residualStatus : '',
     // 采集来源随队列持久化，重启后「直取原图/降级裁切/页面采集」徽标仍在
     captureSource: ['api-raw', 'network', 'dom', 'canvas', 'canvas-screenshot', 'editor-download'].includes(record.captureSource)
       ? record.captureSource
@@ -940,16 +947,206 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           throw new Error(`豆包返回了上传原图而不是生成结果；生成结果画布导出也失败：${canvasError.message}`);
         }
       }
-      const saved = await saveProcessedImage({
+      let saved = await saveProcessedImage({
         candidate,
         sourcePath,
         outputDirectory: settings.outputDirectory,
         settings,
         paddedUpload
       });
+
+      // 通用残留水印闭环：不依赖固定位置、颜色、语言或某一种 Logo。
+      // 先让视觉模型全图复检并返回归一化区域；只对高置信区域自动打粉色遮罩做定点补修，
+      // 每次补修后再次复检，最多 2 轮。复检/补修失败时保留上一张有效结果，不把整单打失败。
+      let autoRepairPasses = 0;
+      let residualAuditCount = 0;
+      let residualStatus = mode === 'manual' ? 'manual-skip' : 'checking';
+      if (mode !== 'manual') {
+        const maxAutoRepairPasses = 2;
+        for (let auditIndex = 0; auditIndex <= maxAutoRepairPasses; auditIndex += 1) {
+          let audit;
+          try {
+            residualAuditCount += 1;
+            batchEvent({
+              type: 'job-progress',
+              ...jobBase,
+              message: `正在全图复检残留水印（${residualAuditCount}/${maxAutoRepairPasses + 1}）`
+            });
+            audit = await automation.inspectWatermarkResidual({
+              filePath: saved.path,
+              prompt: buildWatermarkAuditPrompt(settings),
+              timeoutMs: 90_000
+            });
+          } catch (auditError) {
+            if (auditError.code === 'CANCELLED' || auditError.code === 'VERIFICATION_INTERRUPTED') {
+              await fs.rm(saved.path, { force: true }).catch(() => {});
+              throw auditError;
+            }
+            residualStatus = 'audit-failed';
+            batchEvent({
+              type: 'job-progress',
+              ...jobBase,
+              message: `残留水印自动复检未完成：${auditError.message || auditError}；已保留当前结果`
+            });
+            break;
+          }
+
+          if (!audit.hasResidual) {
+            residualStatus = autoRepairPasses > 0 ? 'repaired-clean' : 'clean';
+            break;
+          }
+
+          const repairRegions = (Array.isArray(audit.regions) ? audit.regions : [])
+            .filter((region) => Number(region.confidence) >= 0.62)
+            .slice(0, 48);
+          if (!repairRegions.length) {
+            residualStatus = 'review';
+            batchEvent({
+              type: 'job-progress',
+              ...jobBase,
+              message: '检测到低置信度疑似标记，为避免误删真实场景文字，已保留当前结果供人工确认'
+            });
+            break;
+          }
+          if (autoRepairPasses >= maxAutoRepairPasses) {
+            residualStatus = 'residual-after-max';
+            batchEvent({
+              type: 'job-progress',
+              ...jobBase,
+              message: '自动补修已达到 2 轮，仍检测到疑似残留，已保留当前最佳结果'
+            });
+            break;
+          }
+
+          const strokes = watermarkRegionsToStrokes(repairRegions, { brushPercent: 3 });
+          if (!strokes.length) {
+            residualStatus = 'review';
+            break;
+          }
+
+          let markedUpload = null;
+          let repairPadding = null;
+          try {
+            batchEvent({
+              type: 'job-progress',
+              ...jobBase,
+              message: `检测到 ${repairRegions.length} 处疑似残留，正在自动定点补修第 ${autoRepairPasses + 1} 轮`
+            });
+            markedUpload = await prepareManualMarkedUpload({
+              sourcePath: saved.path,
+              nativeImage,
+              temporaryDirectory: app.getPath('temp'),
+              strokes,
+              brushPercent: 3
+            });
+
+            const repairPrompt = buildManualEditPrompt(settings);
+            const repairFirstPass = await automation.processImage({
+              filePath: markedUpload.path,
+              prompt: repairPrompt,
+              newConversation: true,
+              conversationId: '',
+              imageWaitSeconds: settings.imageWaitSeconds
+            });
+            let repairCandidates = repairFirstPass.candidates;
+            let repairUploadPath = markedUpload.path;
+
+            // 自动补修同样使用原有的“接口直取优先 + 隔离带降级”链路，
+            // 避免补修本身又把豆包页面水印带进最终结果。
+            if (!repairFirstPass.apiRawHit && settings.addPaddingBeforeUpload && settings.cropMode !== 'never') {
+              repairPadding = await preparePaddedUpload({
+                sourcePath: markedUpload.path,
+                nativeImage,
+                temporaryDirectory: app.getPath('temp'),
+                percent: settings.cropPercent,
+                edge: settings.cropEdge
+              });
+              repairUploadPath = repairPadding.path;
+              const repairSecondPass = await automation.processImage({
+                filePath: repairUploadPath,
+                prompt: repairPrompt,
+                newConversation: true,
+                conversationId: repairFirstPass.conversationId || '',
+                imageWaitSeconds: settings.imageWaitSeconds
+              });
+              repairCandidates = repairSecondPass.candidates;
+            }
+
+            let repairCandidate;
+            try {
+              repairCandidate = await downloadBestImage({
+                candidates: repairCandidates,
+                electronSession: workerWindow.webContents.session,
+                nativeImage,
+                preferOriginal: settings.preferOriginal,
+                onProgress: (message) => batchEvent({ type: 'job-progress', ...jobBase, message })
+              });
+            } catch (downloadError) {
+              repairCandidate = await automation.captureLatestGeneratedCanvas(nativeImage, repairCandidates)
+                .catch((canvasError) => {
+                  throw new Error(`${downloadError.message}；自动补修高清画布兜底也失败：${canvasError.message}`);
+                });
+            }
+
+            const repairMatchesUpload = !String(repairCandidate.source || '').startsWith('canvas')
+              && (await isExactSourceImage(repairCandidate, repairUploadPath)
+                || (repairUploadPath !== markedUpload.path && await isExactSourceImage(repairCandidate, markedUpload.path)));
+            if (repairMatchesUpload) {
+              repairCandidate = await automation.captureLatestGeneratedCanvas(nativeImage, repairCandidates)
+                .catch((canvasError) => {
+                  throw new Error(`自动补修返回了上传图而不是生成结果；高清画布导出也失败：${canvasError.message}`);
+                });
+            }
+
+            const previousPath = saved.path;
+            const repaired = await saveProcessedImage({
+              candidate: repairCandidate,
+              sourcePath,
+              outputDirectory: settings.outputDirectory,
+              settings,
+              paddedUpload: repairPadding
+            });
+
+            // 能复用原文件名时原位替换，避免每轮补修留下 _cleaned-2/_cleaned-3 中间文件。
+            if (path.extname(previousPath).toLowerCase() === path.extname(repaired.path).toLowerCase()) {
+              await fs.rm(previousPath, { force: true }).catch(() => {});
+              await fs.rename(repaired.path, previousPath);
+              repaired.path = previousPath;
+            } else {
+              await fs.rm(previousPath, { force: true }).catch(() => {});
+            }
+            saved = repaired;
+            autoRepairPasses += 1;
+            residualStatus = 'repaired-pending-audit';
+          } catch (repairError) {
+            if (repairError.code === 'CANCELLED' || repairError.code === 'VERIFICATION_INTERRUPTED') {
+              await fs.rm(saved.path, { force: true }).catch(() => {});
+              throw repairError;
+            }
+            residualStatus = 'repair-failed';
+            batchEvent({
+              type: 'job-progress',
+              ...jobBase,
+              message: `自动定点补修失败：${repairError.message || repairError}；已保留上一版有效结果`
+            });
+            break;
+          } finally {
+            if (markedUpload?.directory) {
+              await fs.rm(markedUpload.directory, { recursive: true, force: true }).catch(() => {});
+            }
+            if (repairPadding?.directory) {
+              await fs.rm(repairPadding.directory, { recursive: true, force: true }).catch(() => {});
+            }
+          }
+        }
+      }
+
       const result = {
         ...jobBase,
         ...saved,
+        autoRepairPasses,
+        residualAuditCount,
+        residualStatus,
         conversationId: conversationId || taskConversationId || '',
         sourcePath: eventPath,
         outputPath: saved.path,
