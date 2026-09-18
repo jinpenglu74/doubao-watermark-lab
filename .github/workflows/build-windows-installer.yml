@@ -1,0 +1,57 @@
+name: Build Windows Installer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "package.json"
+      - "package-lock.json"
+      - "src/**"
+      - ".github/workflows/build-windows-installer.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64-installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build Windows x64 installer
+        shell: pwsh
+        run: npx electron-builder --win nsis --x64 --publish never
+
+      - name: Verify installer
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path dist -Filter "*-win-x64-setup.exe" | Select-Object -First 1
+          if (-not $installer) { throw "Windows x64 setup installer was not generated" }
+          Get-FileHash $installer.FullName -Algorithm SHA256 | Format-List
+          Write-Host "INSTALLER_PATH=$($installer.FullName)"
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: doubao-watermark-lab-v1.3.0-win-x64-setup
+          path: dist/*-win-x64-setup.exe
+          if-no-files-found: error
+          retention-days: 30
