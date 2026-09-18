@@ -1263,7 +1263,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               timeoutMs: 90_000
             });
           } catch (auditError) {
-            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(auditError.code)) {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(auditError.code) || isDestroyedObjectError(auditError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw auditError;
             }
@@ -1404,7 +1404,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             autoRepairPasses += 1;
             residualStatus = 'repaired-pending-audit';
           } catch (repairError) {
-            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(repairError.code)) {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(repairError.code) || isDestroyedObjectError(repairError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw repairError;
             }
@@ -1514,9 +1514,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc });
       }
     } catch (error) {
+      error = normalizeTaskError(error);
       if (error.code === 'CANCELLED' || cancelRef.value) return;
-      if (error.code === 'VERIFICATION_INTERRUPTED') return 'retry-verification';
-      if (error.code === 'LOGIN_RECOVERED_RESTART') return 'retry-login';
+      if (error.code === 'VERIFICATION_INTERRUPTED') return { kind: 'retry-verification', error };
+      if (error.code === 'LOGIN_RECOVERED_RESTART') return { kind: 'retry-login', error };
       if (error.code === 'LOGIN_RECOVERY_REQUIRED') {
         try {
           await recoverDoubaoLogin(workerWindow, {
@@ -1524,11 +1525,18 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             jobBase,
             keepVisible: settings.showBrowserWindow
           });
-          return 'retry-login';
+          return { kind: 'retry-login', error };
         } catch (recoveryError) {
           if (recoveryError.code === 'CANCELLED' || cancelRef.value) return;
-          error = recoveryError;
+          error = normalizeTaskError(recoveryError);
         }
+      }
+      if (shouldAutoRetryTaskError(error)) {
+        return {
+          kind: 'retry-error',
+          error,
+          conversationId: error.conversationId || taskConversationId || ''
+        };
       }
       const result = {
         ...jobBase,
