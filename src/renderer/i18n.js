@@ -333,6 +333,8 @@
       (m) => `Login session restored — restarting the current task (attempt ${m[1]}/${m[2]})`],
     [/^本图耗时：首次处理 ([\d.]+)秒(?: \/ 降级重发 ([\d.]+)秒)? \/ 复检 ([\d.]+)秒(?: \/ 补修 ([\d.]+)秒)? \/ 质检 (后台|[\d.]+秒) \/ 复检模式 同会话(?:\/回退(\d+)次)? \/ 总计 ([\d.]+)秒$/,
       (m) => `Timing: first ${m[1]}s${m[2] ? ` / fallback ${m[2]}s` : ''} / audit ${m[3]}s${m[4] ? ` / repair ${m[4]}s` : ''} / QC ${m[5] === '后台' ? 'background' : m[5]} / audit same-chat${m[6] ? ` + fallback x${m[6]}` : ''} / total ${m[7]}s`],
+    [/^本图耗时：首次处理 ([\d.]+)秒(?: \/ 降级重发 ([\d.]+)秒)? \/ 复检 ([\d.]+)秒(?: \/ 补修 ([\d.]+)秒)? \/ 质检 (后台|[\d.]+秒) \/ 复检模式 手动跳过 \/ 总计 ([\d.]+)秒$/,
+      (m) => `Timing: first ${m[1]}s${m[2] ? ` / fallback ${m[2]}s` : ''} / audit ${m[3]}s${m[4] ? ` / repair ${m[4]}s` : ''} / QC ${m[5] === '后台' ? 'background' : m[5]} / audit skipped (manual) / total ${m[6]}s`],
     [/^豆包工作窗口异常，正在重新创建后自动重跑（(\d+)\/(\d+)）$/,
       (m) => `Doubao worker failed — rebuilding and automatically retrying (${m[1]}/${m[2]})`],
     [/^任务失败，正在自动重跑（(\d+)\/(\d+)）：([\s\S]+)$/,
