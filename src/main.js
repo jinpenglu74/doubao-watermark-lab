@@ -1856,7 +1856,7 @@ async function runManualEdit(payload = {}) {
 // 自动质检：对比原图与处理结果，识别"疑似未处理 / 差异过大"并生成差异热力图。
 // 无额外图像依赖：用 nativeImage 解码，统一缩到相同尺寸（≤512）后逐像素比较；
 // 热力图按输出路径命名（同名覆盖，不会越积越多），存于 userData/qc。
-async function runQcCheck(sourcePath, outputPath) {
+async function runQcCheck(sourcePath, outputPath, { forceHeatmap = false } = {}) {
   const sourceImage = nativeImage.createFromPath(sourcePath);
   const outputImage = nativeImage.createFromPath(outputPath);
   if (sourceImage.isEmpty() || outputImage.isEmpty()) throw new Error('质检图片读取失败');
@@ -1870,6 +1870,10 @@ async function runQcCheck(sourcePath, outputPath) {
   const outputPixels = outputImage.resize({ width, height, quality: 'good' }).toBitmap();
   const stats = computeDiffStats(sourcePixels, outputPixels);
   const verdict = verdictForStats(stats);
+
+  // 正常图片不再生成/写入热力图；只有异常结果或明确要求时才做额外 I/O。
+  if (verdict === 'ok' && !forceHeatmap) return { verdict, ...stats, heatmapPath: '' };
+
   const heatmapPixels = buildHeatmap(sourcePixels, outputPixels, width, height, 2);
   const heatmap = nativeImage.createFromBitmap(heatmapPixels, { width, height });
   const directory = path.join(app.getPath('userData'), 'qc');
