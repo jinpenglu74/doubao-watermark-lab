@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { DoubaoAutomation, classifyLoginState, conversationIdFromUrl, imageAssetKey, noImageGeneratedError, parseWatermarkAudit, responseHeader, settledNoImageGraceMs } = require('../src/doubao-automation');
+const { buildSameConversationWatermarkAuditPrompt } = require('../src/prompt');
 
 test('解析新版 Electron 的响应头对象', () => {
   assert.equal(responseHeader({
@@ -182,4 +183,17 @@ test('健康登录状态在 15 秒内复用，强制检查仍会重新确认', a
   assert.equal(checks, 1);
   await automation.requireAuthenticated({ force: true });
   assert.equal(checks, 2);
+});
+
+
+test('同会话残留复检提示词明确锁定刚生成的最后一张结果图', () => {
+  const prompt = buildSameConversationWatermarkAuditPrompt({ language: 'zh' });
+  assert.match(prompt, /刚刚生成的最后一张处理结果图/);
+  assert.match(prompt, /不要检查用户最初上传的原图/);
+  assert.match(prompt, /不要生成新图片/);
+  assert.match(prompt, /hasResidual/);
+});
+
+test('DoubaoAutomation 提供同会话复检能力', () => {
+  assert.equal(typeof DoubaoAutomation.prototype.inspectLatestGeneratedResidual, 'function');
 });
