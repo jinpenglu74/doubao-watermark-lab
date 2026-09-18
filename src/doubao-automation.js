@@ -1570,5 +1570,6 @@ module.exports = {
   parseWatermarkAudit,
   pageLoginStatus,
   pageVerificationState,
-  responseHeader
+  responseHeader,
+  settledNoImageGraceMs
 };
