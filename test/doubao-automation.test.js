@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { classifyLoginState, conversationIdFromUrl, imageAssetKey, noImageGeneratedError, parseWatermarkAudit, responseHeader } = require('../src/doubao-automation');
+const { DoubaoAutomation, classifyLoginState, conversationIdFromUrl, imageAssetKey, noImageGeneratedError, parseWatermarkAudit, responseHeader } = require('../src/doubao-automation');
 
 test('解析新版 Electron 的响应头对象', () => {
   assert.equal(responseHeader({
@@ -143,4 +143,16 @@ test('只有 Cookie、页面信号缺失时保持 uncertain，交给恢复流程
   assert.equal(status.state, 'uncertain');
   assert.equal(status.loggedIn, false);
   assert.equal(status.cookieHint, true);
+});
+
+
+test('已销毁 BrowserWindow 不再冒出 Electron 原始 Object has been destroyed，而是标准 WORKER_DESTROYED', () => {
+  assert.throws(
+    () => new DoubaoAutomation({ isDestroyed: () => true }),
+    (error) => {
+      assert.equal(error.code, 'WORKER_DESTROYED');
+      assert.match(error.message, /豆包工作窗口已失效/);
+      return true;
+    }
+  );
 });

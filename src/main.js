@@ -18,6 +18,15 @@ const {
 } = require('./image-pipeline');
 const { buildManualEditPrompt, buildPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
 const { overwriteGuard, replaceOriginalSafely } = require('./original-overwrite');
+const {
+  MAX_AUTO_RETRIES,
+  exhaustedRetryMessage,
+  isDestroyedObjectError,
+  normalizeTaskError,
+  retryProgressMessage,
+  shouldAutoRetryTaskError,
+  workerDestroyedError
+} = require('./task-retry');
 const { writeZipFile } = require('./zip-writer');
 
 const DOUBAO_PARTITION = 'persist:watermark-lab-doubao';
@@ -448,7 +457,8 @@ async function cookieLoginHint() {
 async function getLoginStatus() {
   const cookieHint = await cookieLoginHint();
   let pageStatus = null;
-  if (doubaoWindow && !doubaoWindow.isDestroyed() && !doubaoWindow.webContents.isLoading()) {
+  const loginContents = safeWebContents(doubaoWindow);
+  if (isDoubaoWorkerUsable(doubaoWindow) && loginContents && !loginContents.isLoading()) {
     try {
       const automation = new DoubaoAutomation(doubaoWindow);
       pageStatus = await automation.getLoginStatus();
@@ -488,9 +498,9 @@ async function waitForSharedLoginRecovery(promise, cancelRef) {
 }
 
 async function loadDoubaoChatForRecovery(workerWindow) {
-  if (!workerWindow || workerWindow.isDestroyed()) {
-    const error = new Error('豆包工作窗口已关闭，无法自动恢复登录');
-    error.code = 'LOGIN_RECOVERY_FAILED';
+  if (!isDoubaoWorkerUsable(workerWindow)) {
+    const error = workerDestroyedError();
+    error.code = 'WORKER_DESTROYED';
     throw error;
   }
   await Promise.race([
@@ -510,8 +520,8 @@ async function recoverDoubaoLogin(workerWindow, {
 } = {}) {
   const progress = (message) => {
     if (jobBase) batchEvent({ type: 'job-progress', ...jobBase, message });
-    if (workerWindow && !workerWindow.isDestroyed()) {
-      workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`);
+    if (isDoubaoWorkerUsable(workerWindow)) {
+      try { workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`); } catch {}
     }
   };
 
@@ -519,7 +529,7 @@ async function recoverDoubaoLogin(workerWindow, {
     progress('另一个任务正在恢复豆包登录，本任务已暂停等待');
     try {
       const result = await waitForSharedLoginRecovery(loginRecoveryGate.promise, cancelRef);
-      if (workerWindow && !workerWindow.isDestroyed()) {
+      if (isDoubaoWorkerUsable(workerWindow)) {
         await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
       }
       return result;
@@ -594,8 +604,8 @@ async function recoverDoubaoLogin(workerWindow, {
       const current = await loginAutomation.getLoginStatus().catch(() => null);
       if (current?.state === 'authenticated') {
         loginFlowActive = false;
-        try { workerWindow.webContents.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
-        if (!keepVisible && !workerWindow.isDestroyed()) workerWindow.hide();
+        try { safeWebContents(workerWindow)?.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
+        if (!keepVisible && isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
         progress('登录会话已恢复，正在重新开始任务');
         return { recovered: true, stage: 'interactive-login' };
       }
@@ -638,42 +648,128 @@ async function recoverDoubaoLogin(workerWindow, {
   }
 }
 
+function safeWebContents(browserWindow) {
+  if (!browserWindow || browserWindow.isDestroyed?.()) return null;
+  try {
+    const contents = browserWindow.webContents;
+    return contents && !contents.isDestroyed?.() ? contents : null;
+  } catch {
+    return null;
+  }
+}
+
+function isDoubaoWorkerUsable(browserWindow) {
+  const contents = safeWebContents(browserWindow);
+  return Boolean(contents && !browserWindow.__workerDead && !browserWindow.__workerUnresponsive);
+}
+
+function doubaoWorkerSession(browserWindow) {
+  const contents = safeWebContents(browserWindow);
+  if (!contents) throw workerDestroyedError();
+  try {
+    return contents.session;
+  } catch (error) {
+    throw normalizeTaskError(error);
+  }
+}
+
+function windowUsesDoubaoSession(browserWindow, persistentSession) {
+  const contents = safeWebContents(browserWindow);
+  if (!contents) return false;
+  try {
+    return contents.session === persistentSession;
+  } catch {
+    return false;
+  }
+}
+
+function bindDoubaoWorkerHealth(browserWindow) {
+  if (!browserWindow || browserWindow.__workerHealthBound) return browserWindow;
+  browserWindow.__workerHealthBound = true;
+  browserWindow.__workerDead = false;
+  browserWindow.__workerUnresponsive = false;
+  browserWindow.__workerFailureReason = '';
+
+  const contents = safeWebContents(browserWindow);
+  if (contents) {
+    contents.on('render-process-gone', (_event, details = {}) => {
+      browserWindow.__workerDead = true;
+      browserWindow.__workerFailureReason = `render-process-gone:${details.reason || 'unknown'}`;
+    });
+    contents.on('destroyed', () => {
+      browserWindow.__workerDead = true;
+      browserWindow.__workerFailureReason = 'webContents-destroyed';
+    });
+  }
+  browserWindow.on('unresponsive', () => {
+    browserWindow.__workerUnresponsive = true;
+    browserWindow.__workerFailureReason = 'unresponsive';
+  });
+  browserWindow.on('responsive', () => {
+    if (!browserWindow.__workerDead) {
+      browserWindow.__workerUnresponsive = false;
+      browserWindow.__workerFailureReason = '';
+    }
+  });
+  return browserWindow;
+}
+
+function discardDoubaoWorker(browserWindow) {
+  if (!browserWindow) return;
+  busyWindows.delete(browserWindow);
+  auxWorkerWindows = auxWorkerWindows.filter((item) => item !== browserWindow);
+  if (doubaoWindow === browserWindow) doubaoWindow = null;
+  try {
+    if (!browserWindow.isDestroyed?.()) browserWindow.destroy();
+  } catch { /* 已损坏的 Electron 对象无需再次处理 */ }
+}
+
 async function broadcastLoginStatus() {
   const status = await getLoginStatus();
   sendToRenderer('login:status', status);
   if (loginFlowActive && status.loggedIn) {
     loginFlowActive = false;
     const persistentSession = session.fromPartition(DOUBAO_PARTITION);
-    persistentSession.flushStorageData();
+    try { persistentSession.flushStorageData(); } catch { /* 忽略持久化瞬时错误 */ }
     clearInterval(loginTimer);
     loginTimer = null;
-    // 只收掉空闲的豆包窗口；正被批次占用（busy）的窗口不能销毁，否则并发中的任务会被打断
+    // 批处理运行期间绝不销毁任何豆包窗口。旧逻辑虽然跳过 busy 窗口，
+    // 但窗口池/登录恢复切换存在极短竞态，可能把仍被异步链持有的 webContents 销毁，
+    // 最终冒出 "Object has been destroyed"。运行中只隐藏空闲窗口，批次结束后再复用/回收。
     for (const window of BrowserWindow.getAllWindows()) {
-      if (window !== mainWindow && !window.isDestroyed()
-        && window.webContents.session === persistentSession && !busyWindows.has(window)) {
+      if (window === mainWindow || !windowUsesDoubaoSession(window, persistentSession) || busyWindows.has(window)) continue;
+      try {
         window.hide();
-        window.destroy();
-      }
+        if (activeBatchCount <= 0 && isDoubaoWorkerUsable(window)) window.destroy();
+      } catch { /* 窗口已损坏时由健康检查/重建链处理 */ }
     }
-    if (!doubaoWindow || doubaoWindow.isDestroyed()) doubaoWindow = null;
+    if (!isDoubaoWorkerUsable(doubaoWindow)) doubaoWindow = null;
   }
 }
 
 async function waitForDoubaoLoad(browser) {
-  if (!browser.webContents.isLoading()) return;
+  if (!isDoubaoWorkerUsable(browser)) throw workerDestroyedError();
+  const contents = safeWebContents(browser);
+  if (!contents) throw workerDestroyedError();
+  if (!contents.isLoading()) return;
   await new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
-      browser.webContents.removeListener('did-finish-load', onFinish);
-      browser.webContents.removeListener('did-fail-load', onFail);
+      try { contents.removeListener('did-finish-load', onFinish); } catch {}
+      try { contents.removeListener('did-fail-load', onFail); } catch {}
+      try { contents.removeListener('destroyed', onDestroyed); } catch {}
     };
     const onFinish = () => {
       cleanup();
       resolve();
     };
+    const onDestroyed = () => {
+      cleanup();
+      reject(workerDestroyedError());
+    };
     // 加载失败（断网、DNS 失败等）立即报错，不再干等超时；子资源失败（isMainFrame=false）忽略
     const onFail = (_event, errorCode, errorDescription, _url, isMainFrame) => {
-      if (!isMainFrame || errorCode === -3) return; // -3 = ERR_ABORTED，页面内部跳转常见，忽略
+      if (!isMainFrame || errorCode === -3) return;
       cleanup();
       reject(new Error(`豆包页面加载失败（${errorDescription || errorCode}），请检查网络后重试`));
     };
@@ -681,8 +777,9 @@ async function waitForDoubaoLoad(browser) {
       cleanup();
       reject(new Error('豆包页面加载超时'));
     }, 35_000);
-    browser.webContents.on('did-finish-load', onFinish);
-    browser.webContents.on('did-fail-load', onFail);
+    contents.on('did-finish-load', onFinish);
+    contents.on('did-fail-load', onFail);
+    contents.once('destroyed', onDestroyed);
   });
 }
 
@@ -708,8 +805,8 @@ async function logoutDoubao() {
 
   const persistentSession = session.fromPartition(DOUBAO_PARTITION);
   for (const window of BrowserWindow.getAllWindows()) {
-    if (window !== mainWindow && !window.isDestroyed() && window.webContents.session === persistentSession) {
-      window.destroy();
+    if (window !== mainWindow && windowUsesDoubaoSession(window, persistentSession)) {
+      try { window.destroy(); } catch {}
     }
   }
   doubaoWindow = null;
@@ -727,13 +824,14 @@ async function logoutDoubao() {
 }
 
 function createDoubaoWindow({ focus = true } = {}) {
-  if (doubaoWindow && !doubaoWindow.isDestroyed()) {
+  if (doubaoWindow && isDoubaoWorkerUsable(doubaoWindow)) {
     if (focus) doubaoWindow.show();
     return doubaoWindow;
   }
+  if (doubaoWindow) discardDoubaoWorker(doubaoWindow);
 
   configureDoubaoSession();
-  doubaoWindow = new BrowserWindow({
+  doubaoWindow = bindDoubaoWorkerHealth(new BrowserWindow({
     width: 1120,
     height: 820,
     minWidth: 780,
@@ -749,7 +847,7 @@ function createDoubaoWindow({ focus = true } = {}) {
       backgroundThrottling: false,
       safeDialogs: true
     }
-  });
+  }));
 
   doubaoWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -775,14 +873,16 @@ function createDoubaoWindow({ focus = true } = {}) {
   doubaoWindow.webContents.on('did-finish-load', update);
   doubaoWindow.webContents.on('did-navigate', update);
   doubaoWindow.webContents.on('did-navigate-in-page', update);
-  doubaoWindow.loadURL(DOUBAO_CHAT_URL);
-  doubaoWindow.on('closed', () => {
-    doubaoWindow = null;
-    loginFlowActive = false;
+  doubaoWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
+  const createdDoubaoWindow = doubaoWindow;
+  createdDoubaoWindow.on('closed', () => {
+    if (doubaoWindow === createdDoubaoWindow) doubaoWindow = null;
+    if (activeBatchCount <= 0) loginFlowActive = false;
     clearInterval(loginTimer);
     loginTimer = null;
-    broadcastLoginStatus();
+    broadcastLoginStatus().catch(() => {});
   });
+  clearInterval(loginTimer);
   loginTimer = setInterval(broadcastLoginStatus, 5000);
   return doubaoWindow;
 }
@@ -790,7 +890,7 @@ function createDoubaoWindow({ focus = true } = {}) {
 let auxWorkerWindows = [];
 
 function createAuxWorkerWindow(position) {
-  const workerWindow = new BrowserWindow({
+  const workerWindow = bindDoubaoWorkerHealth(new BrowserWindow({
     width: 1120,
     height: 820,
     minWidth: 780,
@@ -806,7 +906,7 @@ function createAuxWorkerWindow(position) {
       backgroundThrottling: false,
       safeDialogs: true
     }
-  });
+  }));
 
   workerWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -831,15 +931,15 @@ function createAuxWorkerWindow(position) {
   workerWindow.on('closed', () => {
     auxWorkerWindows = auxWorkerWindows.filter((item) => item !== workerWindow);
   });
-  workerWindow.loadURL(DOUBAO_CHAT_URL);
+  workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
   return workerWindow;
 }
 
 function hideIdleDoubaoWindows() {
   const persistentSession = session.fromPartition(DOUBAO_PARTITION);
   for (const window of BrowserWindow.getAllWindows()) {
-    if (window !== mainWindow && !window.isDestroyed() && window.webContents.session === persistentSession && !busyWindows.has(window)) {
-      window.hide();
+    if (window !== mainWindow && windowUsesDoubaoSession(window, persistentSession) && !busyWindows.has(window)) {
+      try { window.hide(); } catch {}
     }
   }
 }
@@ -848,7 +948,7 @@ function hideIdleDoubaoWindows() {
 async function acquireBatchWindows(count, { show }) {
   createDoubaoWindow({ focus: false });
   const idleWindows = () => [doubaoWindow, ...auxWorkerWindows]
-    .filter((window) => window && !window.isDestroyed() && !busyWindows.has(window));
+    .filter((window) => isDoubaoWorkerUsable(window) && !busyWindows.has(window));
   const windows = [];
   for (let index = 0; index < count; index += 1) {
     let window = idleWindows().find((item) => !windows.includes(item));
@@ -877,6 +977,24 @@ async function acquireBatchWindows(count, { show }) {
     throw error;
   }
   return windows;
+}
+
+async function rebuildBatchWorker(slot, { show = false } = {}) {
+  const previous = slot?.window || null;
+  if (previous) discardDoubaoWorker(previous);
+
+  const replacement = createAuxWorkerWindow(Number(slot?.position) || 0);
+  auxWorkerWindows.push(replacement);
+  busyWindows.add(replacement);
+  if (!replacement.__baseTitle) replacement.__baseTitle = replacement.getTitle();
+  if (slot) slot.window = replacement;
+
+  if (show) {
+    replacement.setPosition(90 + (Number(slot?.position) || 0) * 56, 70 + (Number(slot?.position) || 0) * 48);
+    replacement.show();
+  }
+  await waitForDoubaoLoad(replacement);
+  return replacement;
 }
 
 async function validateImagePaths(paths) {
@@ -956,11 +1074,14 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
   const windows = await acquireBatchWindows(useParallel ? Math.min(settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT, files.length) : 1, {
     show: settings.showBrowserWindow
   });
-  const browser = windows[0];
-  const releaseWindows = () => windows.forEach((window) => {
+  const workerSlots = windows.map((window, position) => ({ window, position }));
+  const browser = workerSlots[0]?.window || null;
+  const releaseWindows = () => workerSlots.forEach((slot) => {
+    const window = slot.window;
     busyWindows.delete(window);
-    // 还原任务期间显示进度的窗口标题
-    if (!window.isDestroyed() && window.__baseTitle) window.setTitle(window.__baseTitle);
+    if (isDoubaoWorkerUsable(window) && window.__baseTitle) {
+      try { window.setTitle(window.__baseTitle); } catch {}
+    }
   });
 
   batchEvent({
@@ -1000,8 +1121,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       // 进度同时打到豆包窗口标题：开着调试窗口时能直接看到当前进行到哪一步，不再像卡住
       onProgress: (message) => {
         batchEvent({ type: 'job-progress', ...jobBase, message });
-        if (workerWindow && !workerWindow.isDestroyed()) {
-          workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`);
+        if (isDoubaoWorkerUsable(workerWindow)) {
+          try { workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`); } catch {}
         }
       },
       // 返回 false = 已有其他窗口在验证（本任务是跟随者）：不弹窗，静默等待领头完成后自动重跑。
@@ -1009,8 +1130,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       onVerificationRequired: () => {
         if (verificationGate.owner && verificationGate.owner !== verificationToken) return false;
         verificationGate.owner = verificationToken;
-        const focusTarget = (workerWindow && !workerWindow.isDestroyed() && workerWindow) || browser;
-        if (focusTarget && !focusTarget.isDestroyed()) {
+        const focusTarget = isDoubaoWorkerUsable(workerWindow)
+          ? workerWindow
+          : (isDoubaoWorkerUsable(browser) ? browser : null);
+        if (focusTarget) {
           if (focusTarget.isMinimized()) focusTarget.restore();
           focusTarget.show();
           focusTarget.moveTop();
@@ -1027,7 +1150,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         verificationEpoch.value += 1;
         batchEvent({ type: 'verification-cleared', ...jobBase });
         if (!settings.showBrowserWindow) {
-          if (workerWindow && !workerWindow.isDestroyed()) workerWindow.hide();
+          if (isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
           hideIdleDoubaoWindows();
         }
       }
@@ -1086,7 +1209,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       try {
         candidate = await downloadBestImage({
           candidates,
-          electronSession: workerWindow.webContents.session,
+          electronSession: doubaoWorkerSession(workerWindow),
           nativeImage,
           preferOriginal: settings.preferOriginal,
           onProgress: (message) => {
@@ -1155,7 +1278,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               timeoutMs: 90_000
             });
           } catch (auditError) {
-            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(auditError.code)) {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(auditError.code) || isDestroyedObjectError(auditError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw auditError;
             }
@@ -1253,7 +1376,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             try {
               repairCandidate = await downloadBestImage({
                 candidates: repairCandidates,
-                electronSession: workerWindow.webContents.session,
+                electronSession: doubaoWorkerSession(workerWindow),
                 nativeImage,
                 preferOriginal: settings.preferOriginal,
                 onProgress: (message) => batchEvent({ type: 'job-progress', ...jobBase, message })
@@ -1296,7 +1419,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             autoRepairPasses += 1;
             residualStatus = 'repaired-pending-audit';
           } catch (repairError) {
-            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(repairError.code)) {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(repairError.code) || isDestroyedObjectError(repairError)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw repairError;
             }
@@ -1406,9 +1529,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc });
       }
     } catch (error) {
+      error = normalizeTaskError(error);
       if (error.code === 'CANCELLED' || cancelRef.value) return;
-      if (error.code === 'VERIFICATION_INTERRUPTED') return 'retry-verification';
-      if (error.code === 'LOGIN_RECOVERED_RESTART') return 'retry-login';
+      if (error.code === 'VERIFICATION_INTERRUPTED') return { kind: 'retry-verification', error };
+      if (error.code === 'LOGIN_RECOVERED_RESTART') return { kind: 'retry-login', error };
       if (error.code === 'LOGIN_RECOVERY_REQUIRED') {
         try {
           await recoverDoubaoLogin(workerWindow, {
@@ -1416,11 +1540,18 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             jobBase,
             keepVisible: settings.showBrowserWindow
           });
-          return 'retry-login';
+          return { kind: 'retry-login', error };
         } catch (recoveryError) {
           if (recoveryError.code === 'CANCELLED' || cancelRef.value) return;
-          error = recoveryError;
+          error = normalizeTaskError(recoveryError);
         }
+      }
+      if (shouldAutoRetryTaskError(error)) {
+        return {
+          kind: 'retry-error',
+          error,
+          conversationId: error.conversationId || taskConversationId || ''
+        };
       }
       const result = {
         ...jobBase,
@@ -1439,35 +1570,63 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     }
   };
 
-  // 安全验证与登录恢复都采用“恢复完成后整任务重跑”，避免继续使用可能已失效的上传/生成上下文。
-  // 两类恢复分别计数：安全验证最多 2 次，登录恢复最多 3 次，互不占用彼此次数。
-  const processAt = async (index, workerWindow) => {
+  // 安全验证、登录恢复与普通失败分别管理重启次数。
+  // 普通可恢复失败最多自动重跑 3 次；每次都重建当前 worker，彻底丢弃可能污染/失效的页面上下文。
+  const processAt = async (index, slot) => {
     const maxVerificationRestarts = 2;
     const maxLoginRestarts = 3;
     let verificationRestarts = 0;
     let loginRestarts = 0;
+    let autoRetries = 0;
     const epochRef = {
       verification: verificationEpoch.value,
       login: loginRecoveryEpoch.value
     };
 
+    const file = files[index];
+    const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
+    const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
+    const common = {
+      index,
+      batchId,
+      path: eventPath,
+      name: path.basename(sourcePath),
+      total: files.length,
+      mode
+    };
+
     while (!cancelRef.value) {
-      const outcome = await processAttempt(index, workerWindow, epochRef);
+      let workerWindow = slot.window;
+      let outcome;
+
+      if (!isDoubaoWorkerUsable(workerWindow)) {
+        outcome = { kind: 'retry-error', error: workerDestroyedError() };
+      } else {
+        try {
+          outcome = await processAttempt(index, workerWindow, epochRef);
+        } catch (error) {
+          const normalized = normalizeTaskError(error);
+          if (normalized.code === 'CANCELLED' || cancelRef.value) return;
+          outcome = shouldAutoRetryTaskError(normalized)
+            ? { kind: 'retry-error', error: normalized }
+            : { kind: 'fatal-error', error: normalized };
+        }
+      }
+
       if (!outcome || cancelRef.value) return;
 
-      const file = files[index];
-      const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
-      const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
-      const common = {
-        index,
-        batchId,
-        path: eventPath,
-        name: path.basename(sourcePath),
-        total: files.length,
-        mode
-      };
+      if (outcome.kind === 'fatal-error') {
+        const result = {
+          ...common,
+          error: outcome.error?.message || String(outcome.error || '任务失败'),
+          conversationId: typeof files[index].conversationId === 'string' ? files[index].conversationId : ''
+        };
+        results.push(result);
+        batchEvent({ type: 'job-error', ...result });
+        return;
+      }
 
-      if (outcome === 'retry-login') {
+      if (outcome.kind === 'retry-login') {
         loginRestarts += 1;
         if (loginRestarts > maxLoginRestarts) {
           const result = {
@@ -1479,7 +1638,11 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           batchEvent({ type: 'job-error', ...result });
           return;
         }
-        if (workerWindow && !workerWindow.isDestroyed()) {
+        workerWindow = slot.window;
+        if (!isDoubaoWorkerUsable(workerWindow)) {
+          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow }).catch(() => {});
+          workerWindow = slot.window;
+        } else {
           await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
         }
         epochRef.login = loginRecoveryEpoch.value;
@@ -1492,7 +1655,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         continue;
       }
 
-      if (outcome === 'retry-verification') {
+      if (outcome.kind === 'retry-verification') {
         verificationRestarts += 1;
         if (verificationRestarts > maxVerificationRestarts) {
           const result = {
@@ -1504,13 +1667,17 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           batchEvent({ type: 'job-error', ...result });
           return;
         }
-        // 验证是会话级风控；重跑前统一刷新聊天页，清掉当前窗口残留的挑战浮层。
-        if (workerWindow && !workerWindow.isDestroyed()) {
+
+        workerWindow = slot.window;
+        if (!isDoubaoWorkerUsable(workerWindow)) {
+          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow }).catch(() => {});
+        } else {
           await Promise.race([
             workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {}),
             new Promise((resolve) => setTimeout(resolve, 15_000))
           ]);
         }
+
         epochRef.verification = verificationEpoch.value;
         epochRef.login = loginRecoveryEpoch.value;
         batchEvent({
@@ -1518,6 +1685,53 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ...common,
           message: `安全验证已中断任务，正在重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
         });
+        continue;
+      }
+
+      if (outcome.kind === 'retry-error') {
+        const retryError = normalizeTaskError(outcome.error);
+        if (!shouldAutoRetryTaskError(retryError)) {
+          const result = {
+            ...common,
+            error: retryError.message || String(retryError),
+            conversationId: outcome.conversationId || (typeof files[index].conversationId === 'string' ? files[index].conversationId : '')
+          };
+          results.push(result);
+          batchEvent({ type: 'job-error', ...result });
+          return;
+        }
+
+        autoRetries += 1;
+        if (autoRetries > MAX_AUTO_RETRIES) {
+          const result = {
+            ...common,
+            error: exhaustedRetryMessage(retryError, MAX_AUTO_RETRIES),
+            conversationId: outcome.conversationId || (typeof files[index].conversationId === 'string' ? files[index].conversationId : '')
+          };
+          results.push(result);
+          batchEvent({ type: 'job-error', ...result });
+          return;
+        }
+
+        batchEvent({
+          type: 'job-progress',
+          ...common,
+          message: retryProgressMessage(retryError, autoRetries, MAX_AUTO_RETRIES)
+        });
+
+        // 所有普通失败都换一个全新的 worker 再跑，避免旧 DOM、旧 debugger、旧渲染进程状态污染下一次尝试。
+        try {
+          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow });
+        } catch (rebuildError) {
+          const normalizedRebuild = normalizeTaskError(rebuildError);
+          batchEvent({
+            type: 'job-progress',
+            ...common,
+            message: `重新创建豆包工作窗口未完成：${normalizedRebuild.message || normalizedRebuild}`
+          });
+        }
+        epochRef.login = loginRecoveryEpoch.value;
+        epochRef.verification = verificationEpoch.value;
         continue;
       }
 
@@ -1529,7 +1743,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     if (!useParallel) {
       for (let index = 0; index < files.length; index += 1) {
         if (cancelRef.value) break;
-        await processAt(index, browser);
+        await processAt(index, workerSlots[0]);
         if (index < files.length - 1 && !cancelRef.value && settings.intervalSeconds > 0) {
           batchEvent({ type: 'batch-wait', seconds: settings.intervalSeconds, nextIndex: index + 1 });
           await new Promise((resolve) => setTimeout(resolve, settings.intervalSeconds * 1000));
@@ -1540,15 +1754,15 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       // 每个任务本身要经历开对话/上传/发送多个步骤，各窗口的请求节奏天然错开；
       // 偶发的安全验证由批次级验证兜底机制处理（暂停 → 手动完成 → 整批自动重启）
       let nextIndex = 0;
-      const worker = async (workerWindow) => {
+      const worker = async (slot) => {
         while (!cancelRef.value) {
           const index = nextIndex;
           nextIndex += 1;
           if (index >= files.length) return;
-          await processAt(index, workerWindow);
+          await processAt(index, slot);
         }
       };
-      await Promise.all(windows.map((workerWindow) => worker(workerWindow)));
+      await Promise.all(workerSlots.map((slot) => worker(slot)));
     }
   } finally {
     releaseWindows();
