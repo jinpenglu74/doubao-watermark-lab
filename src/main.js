@@ -18,6 +18,15 @@ const {
 } = require('./image-pipeline');
 const { buildManualEditPrompt, buildPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
 const { overwriteGuard, replaceOriginalSafely } = require('./original-overwrite');
+const {
+  MAX_AUTO_RETRIES,
+  exhaustedRetryMessage,
+  isDestroyedObjectError,
+  normalizeTaskError,
+  retryProgressMessage,
+  shouldAutoRetryTaskError,
+  workerDestroyedError
+} = require('./task-retry');
 const { writeZipFile } = require('./zip-writer');
 
 const DOUBAO_PARTITION = 'persist:watermark-lab-doubao';
@@ -636,6 +645,72 @@ async function recoverDoubaoLogin(workerWindow, {
       loginRecoveryGate.promise = null;
     }
   }
+}
+
+function safeWebContents(browserWindow) {
+  if (!browserWindow || browserWindow.isDestroyed?.()) return null;
+  try {
+    const contents = browserWindow.webContents;
+    return contents && !contents.isDestroyed?.() ? contents : null;
+  } catch {
+    return null;
+  }
+}
+
+function isDoubaoWorkerUsable(browserWindow) {
+  const contents = safeWebContents(browserWindow);
+  return Boolean(contents && !browserWindow.__workerDead && !browserWindow.__workerUnresponsive);
+}
+
+function windowUsesDoubaoSession(browserWindow, persistentSession) {
+  const contents = safeWebContents(browserWindow);
+  if (!contents) return false;
+  try {
+    return contents.session === persistentSession;
+  } catch {
+    return false;
+  }
+}
+
+function bindDoubaoWorkerHealth(browserWindow) {
+  if (!browserWindow || browserWindow.__workerHealthBound) return browserWindow;
+  browserWindow.__workerHealthBound = true;
+  browserWindow.__workerDead = false;
+  browserWindow.__workerUnresponsive = false;
+  browserWindow.__workerFailureReason = '';
+
+  const contents = safeWebContents(browserWindow);
+  if (contents) {
+    contents.on('render-process-gone', (_event, details = {}) => {
+      browserWindow.__workerDead = true;
+      browserWindow.__workerFailureReason = `render-process-gone:${details.reason || 'unknown'}`;
+    });
+    contents.on('destroyed', () => {
+      browserWindow.__workerDead = true;
+      browserWindow.__workerFailureReason = 'webContents-destroyed';
+    });
+  }
+  browserWindow.on('unresponsive', () => {
+    browserWindow.__workerUnresponsive = true;
+    browserWindow.__workerFailureReason = 'unresponsive';
+  });
+  browserWindow.on('responsive', () => {
+    if (!browserWindow.__workerDead) {
+      browserWindow.__workerUnresponsive = false;
+      browserWindow.__workerFailureReason = '';
+    }
+  });
+  return browserWindow;
+}
+
+function discardDoubaoWorker(browserWindow) {
+  if (!browserWindow) return;
+  busyWindows.delete(browserWindow);
+  auxWorkerWindows = auxWorkerWindows.filter((item) => item !== browserWindow);
+  if (doubaoWindow === browserWindow) doubaoWindow = null;
+  try {
+    if (!browserWindow.isDestroyed?.()) browserWindow.destroy();
+  } catch { /* 已损坏的 Electron 对象无需再次处理 */ }
 }
 
 async function broadcastLoginStatus() {
