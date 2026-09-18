@@ -17,6 +17,7 @@ const {
   watermarkRegionsToStrokes
 } = require('./image-pipeline');
 const { buildManualEditPrompt, buildPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
+const { overwriteGuard, replaceOriginalSafely } = require('./original-overwrite');
 const { writeZipFile } = require('./zip-writer');
 
 const DOUBAO_PARTITION = 'persist:watermark-lab-doubao';
@@ -63,6 +64,8 @@ const DEFAULT_SETTINGS = {
   cropCompensationPercent: 0.5,
   intervalSeconds: 30,
   imageWaitSeconds: 60,
+  overwriteOriginal: false,
+  overwriteOriginalConfirmed: false,
   parallelProcessing: true,
   showBrowserWindow: false,
   themeMode: 'auto',
@@ -161,6 +164,7 @@ function sanitizeSettings(input = {}) {
   const themeColor = typeof input.themeColor === 'string' && /^#[0-9a-f]{6}$/i.test(input.themeColor)
     ? input.themeColor.toLowerCase()
     : fallbackThemeColor;
+  const overwriteOriginalConfirmed = input.overwriteOriginalConfirmed === true;
   return {
     outputDirectory: typeof input.outputDirectory === 'string' && input.outputDirectory
       ? path.resolve(input.outputDirectory)
@@ -175,6 +179,8 @@ function sanitizeSettings(input = {}) {
     cropCompensationPercent: Math.min(3, Math.max(0, Number(input.cropCompensationPercent) || 0)),
     intervalSeconds: Math.min(600, Math.max(0, Number.isFinite(Number(input.intervalSeconds)) ? Math.round(Number(input.intervalSeconds)) : 30)),
     imageWaitSeconds: Math.min(300, Math.max(5, Number.isFinite(Number(input.imageWaitSeconds)) ? Math.round(Number(input.imageWaitSeconds)) : 60)),
+    overwriteOriginalConfirmed,
+    overwriteOriginal: input.overwriteOriginal === true && overwriteOriginalConfirmed,
     parallelProcessing: input.parallelProcessing === true,
     maxConcurrentTasks: Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(Number(input.maxConcurrentTasks) || PARALLEL_WORKER_COUNT))),
     showBrowserWindow: input.showBrowserWindow !== false,
@@ -292,6 +298,11 @@ function sanitizeQueueRecord(record = {}) {
       'manual-skip', 'checking', 'clean', 'repaired-clean', 'review',
       'residual-after-max', 'audit-failed', 'repair-failed', 'repaired-pending-audit'
     ].includes(record.residualStatus) ? record.residualStatus : '',
+    overwroteOriginal: record.overwroteOriginal === true,
+    overwriteStatus: [
+      'disabled', 'overwritten', 'manual-skip', 'blocked-residual', 'blocked-qc',
+      'unsupported-format', 'failed'
+    ].includes(record.overwriteStatus) ? record.overwriteStatus : '',
     // 采集来源随队列持久化，重启后「直取原图/降级裁切/页面采集」徽标仍在
     captureSource: ['api-raw', 'network', 'dom', 'canvas', 'canvas-screenshot', 'editor-download'].includes(record.captureSource)
       ? record.captureSource
@@ -1141,12 +1152,83 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         }
       }
 
+      // 最终像素质检必须在覆盖原图之前完成；只有“残留复检通过 + 像素质检正常”才允许替换。
+      let finalQc = null;
+      try {
+        finalQc = await runQcCheck(sourcePath, saved.path);
+      } catch (qcError) {
+        batchEvent({
+          type: 'job-progress',
+          ...jobBase,
+          message: `最终质检未完成：${qcError.message || qcError}；不会覆盖原图`
+        });
+      }
+
+      let overwriteStatus = settings.overwriteOriginal ? 'blocked-qc' : 'disabled';
+      let overwroteOriginal = false;
+      let refreshedSource = null;
+      const overwriteDecision = overwriteGuard({
+        enabled: settings.overwriteOriginal,
+        mode,
+        residualStatus,
+        qcVerdict: finalQc?.verdict || 'unavailable'
+      });
+
+      if (overwriteDecision.allowed) {
+        try {
+          batchEvent({
+            type: 'job-progress',
+            ...jobBase,
+            message: '最终复检和质检均通过，正在安全覆盖原图'
+          });
+          const replaced = await replaceOriginalSafely({
+            sourcePath,
+            resultPath: saved.path,
+            nativeImage
+          });
+          saved = {
+            ...saved,
+            path: replaced.path,
+            width: replaced.width,
+            height: replaced.height
+          };
+          overwroteOriginal = true;
+          overwriteStatus = 'overwritten';
+          refreshedSource = (await validateImagePaths([sourcePath]))[0] || null;
+          batchEvent({
+            type: 'job-progress',
+            ...jobBase,
+            message: '已安全覆盖原图'
+          });
+        } catch (overwriteError) {
+          overwriteStatus = overwriteError.code === 'UNSUPPORTED_ORIGINAL_FORMAT'
+            ? 'unsupported-format'
+            : 'failed';
+          batchEvent({
+            type: 'job-progress',
+            ...jobBase,
+            message: `${overwriteError.message || overwriteError}；原图保持不变`
+          });
+        }
+      } else if (settings.overwriteOriginal) {
+        overwriteStatus = overwriteDecision.reason;
+        const reasonMessage = overwriteDecision.reason === 'manual-skip'
+          ? '手动涂抹重绘不会自动覆盖原图，结果已保留在输出目录'
+          : overwriteDecision.reason === 'blocked-residual'
+            ? '残留水印最终复检未通过，不覆盖原图'
+            : '最终像素质检未通过，不覆盖原图';
+        batchEvent({ type: 'job-progress', ...jobBase, message: reasonMessage });
+      }
+
       const result = {
         ...jobBase,
         ...saved,
         autoRepairPasses,
         residualAuditCount,
         residualStatus,
+        overwroteOriginal,
+        overwriteStatus,
+        ...(refreshedSource ? { refreshedSource } : {}),
         conversationId: conversationId || taskConversationId || '',
         sourcePath: eventPath,
         outputPath: saved.path,
@@ -1154,10 +1236,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       };
       results.push(result);
       batchEvent({ type: 'job-complete', ...result });
-      // 自动质检：不阻塞队列，对比完成后单独推送结论（失败静默忽略，不影响任务本身）
-      runQcCheck(sourcePath, saved.path)
-        .then((qc) => batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc }))
-        .catch(() => {});
+      if (finalQc) {
+        batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc });
+      }
     } catch (error) {
       if (error.code === 'CANCELLED' || cancelRef.value) return;
       if (error.code === 'VERIFICATION_INTERRUPTED') return 'retry';
