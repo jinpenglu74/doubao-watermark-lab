@@ -612,8 +612,22 @@ async function recoverDoubaoLogin(workerWindow, {
   try {
     const result = await recoveryPromise;
     recoverySucceeded = true;
-    loginRecoveryEpoch.value += 1;
-    await broadcastLoginStatus().catch(() => {});
+    // 仅仅“重新复查后发现原本就已登录”不广播全局重启，避免一个窗口的假阴性打断其他正常任务。
+    if (result?.stage !== 'recheck') loginRecoveryEpoch.value += 1;
+    try {
+      if (doubaoWindow && !doubaoWindow.isDestroyed()
+        && doubaoWindow !== workerWindow && !busyWindows.has(doubaoWindow)) {
+        await loadDoubaoChatForRecovery(doubaoWindow);
+      }
+    } catch { /* 主登录窗口刷新失败不影响已恢复的工作窗口 */ }
+    // 恢复窗口已经实测可聊天，直接同步顶部状态；避免另一个尚未重载的旧窗口 DOM 短暂把状态打回“未登录”。
+    sendToRenderer('login:status', {
+      loggedIn: true,
+      state: 'authenticated',
+      cookieHint: true,
+      pageStatus: null,
+      persistent: true
+    });
     return result;
   } finally {
     if (loginRecoveryGate.owner === token) {
