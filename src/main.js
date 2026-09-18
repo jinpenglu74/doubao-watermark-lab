@@ -1560,35 +1560,63 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     }
   };
 
-  // 安全验证与登录恢复都采用“恢复完成后整任务重跑”，避免继续使用可能已失效的上传/生成上下文。
-  // 两类恢复分别计数：安全验证最多 2 次，登录恢复最多 3 次，互不占用彼此次数。
-  const processAt = async (index, workerWindow) => {
+  // 安全验证、登录恢复与普通失败分别管理重启次数。
+  // 普通可恢复失败最多自动重跑 3 次；每次都重建当前 worker，彻底丢弃可能污染/失效的页面上下文。
+  const processAt = async (index, slot) => {
     const maxVerificationRestarts = 2;
     const maxLoginRestarts = 3;
     let verificationRestarts = 0;
     let loginRestarts = 0;
+    let autoRetries = 0;
     const epochRef = {
       verification: verificationEpoch.value,
       login: loginRecoveryEpoch.value
     };
 
+    const file = files[index];
+    const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
+    const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
+    const common = {
+      index,
+      batchId,
+      path: eventPath,
+      name: path.basename(sourcePath),
+      total: files.length,
+      mode
+    };
+
     while (!cancelRef.value) {
-      const outcome = await processAttempt(index, workerWindow, epochRef);
+      let workerWindow = slot.window;
+      let outcome;
+
+      if (!isDoubaoWorkerUsable(workerWindow)) {
+        outcome = { kind: 'retry-error', error: workerDestroyedError() };
+      } else {
+        try {
+          outcome = await processAttempt(index, workerWindow, epochRef);
+        } catch (error) {
+          const normalized = normalizeTaskError(error);
+          if (normalized.code === 'CANCELLED' || cancelRef.value) return;
+          outcome = shouldAutoRetryTaskError(normalized)
+            ? { kind: 'retry-error', error: normalized }
+            : { kind: 'fatal-error', error: normalized };
+        }
+      }
+
       if (!outcome || cancelRef.value) return;
 
-      const file = files[index];
-      const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
-      const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
-      const common = {
-        index,
-        batchId,
-        path: eventPath,
-        name: path.basename(sourcePath),
-        total: files.length,
-        mode
-      };
+      if (outcome.kind === 'fatal-error') {
+        const result = {
+          ...common,
+          error: outcome.error?.message || String(outcome.error || '任务失败'),
+          conversationId: typeof files[index].conversationId === 'string' ? files[index].conversationId : ''
+        };
+        results.push(result);
+        batchEvent({ type: 'job-error', ...result });
+        return;
+      }
 
-      if (outcome === 'retry-login') {
+      if (outcome.kind === 'retry-login') {
         loginRestarts += 1;
         if (loginRestarts > maxLoginRestarts) {
           const result = {
@@ -1600,7 +1628,11 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           batchEvent({ type: 'job-error', ...result });
           return;
         }
-        if (workerWindow && !workerWindow.isDestroyed()) {
+        workerWindow = slot.window;
+        if (!isDoubaoWorkerUsable(workerWindow)) {
+          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow }).catch(() => {});
+          workerWindow = slot.window;
+        } else {
           await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
         }
         epochRef.login = loginRecoveryEpoch.value;
@@ -1613,7 +1645,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         continue;
       }
 
-      if (outcome === 'retry-verification') {
+      if (outcome.kind === 'retry-verification') {
         verificationRestarts += 1;
         if (verificationRestarts > maxVerificationRestarts) {
           const result = {
@@ -1625,13 +1657,17 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           batchEvent({ type: 'job-error', ...result });
           return;
         }
-        // 验证是会话级风控；重跑前统一刷新聊天页，清掉当前窗口残留的挑战浮层。
-        if (workerWindow && !workerWindow.isDestroyed()) {
+
+        workerWindow = slot.window;
+        if (!isDoubaoWorkerUsable(workerWindow)) {
+          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow }).catch(() => {});
+        } else {
           await Promise.race([
             workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {}),
             new Promise((resolve) => setTimeout(resolve, 15_000))
           ]);
         }
+
         epochRef.verification = verificationEpoch.value;
         epochRef.login = loginRecoveryEpoch.value;
         batchEvent({
@@ -1639,6 +1675,53 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ...common,
           message: `安全验证已中断任务，正在重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
         });
+        continue;
+      }
+
+      if (outcome.kind === 'retry-error') {
+        const retryError = normalizeTaskError(outcome.error);
+        if (!shouldAutoRetryTaskError(retryError)) {
+          const result = {
+            ...common,
+            error: retryError.message || String(retryError),
+            conversationId: outcome.conversationId || (typeof files[index].conversationId === 'string' ? files[index].conversationId : '')
+          };
+          results.push(result);
+          batchEvent({ type: 'job-error', ...result });
+          return;
+        }
+
+        autoRetries += 1;
+        if (autoRetries > MAX_AUTO_RETRIES) {
+          const result = {
+            ...common,
+            error: exhaustedRetryMessage(retryError, MAX_AUTO_RETRIES),
+            conversationId: outcome.conversationId || (typeof files[index].conversationId === 'string' ? files[index].conversationId : '')
+          };
+          results.push(result);
+          batchEvent({ type: 'job-error', ...result });
+          return;
+        }
+
+        batchEvent({
+          type: 'job-progress',
+          ...common,
+          message: retryProgressMessage(retryError, autoRetries, MAX_AUTO_RETRIES)
+        });
+
+        // 所有普通失败都换一个全新的 worker 再跑，避免旧 DOM、旧 debugger、旧渲染进程状态污染下一次尝试。
+        try {
+          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow });
+        } catch (rebuildError) {
+          const normalizedRebuild = normalizeTaskError(rebuildError);
+          batchEvent({
+            type: 'job-progress',
+            ...common,
+            message: `重新创建豆包工作窗口未完成：${normalizedRebuild.message || normalizedRebuild}`
+          });
+        }
+        epochRef.login = loginRecoveryEpoch.value;
+        epochRef.verification = verificationEpoch.value;
         continue;
       }
 
@@ -1650,7 +1733,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     if (!useParallel) {
       for (let index = 0; index < files.length; index += 1) {
         if (cancelRef.value) break;
-        await processAt(index, browser);
+        await processAt(index, workerSlots[0]);
         if (index < files.length - 1 && !cancelRef.value && settings.intervalSeconds > 0) {
           batchEvent({ type: 'batch-wait', seconds: settings.intervalSeconds, nextIndex: index + 1 });
           await new Promise((resolve) => setTimeout(resolve, settings.intervalSeconds * 1000));
@@ -1661,15 +1744,15 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       // 每个任务本身要经历开对话/上传/发送多个步骤，各窗口的请求节奏天然错开；
       // 偶发的安全验证由批次级验证兜底机制处理（暂停 → 手动完成 → 整批自动重启）
       let nextIndex = 0;
-      const worker = async (workerWindow) => {
+      const worker = async (slot) => {
         while (!cancelRef.value) {
           const index = nextIndex;
           nextIndex += 1;
           if (index >= files.length) return;
-          await processAt(index, workerWindow);
+          await processAt(index, slot);
         }
       };
-      await Promise.all(windows.map((workerWindow) => worker(workerWindow)));
+      await Promise.all(workerSlots.map((slot) => worker(slot)));
     }
   } finally {
     releaseWindows();
