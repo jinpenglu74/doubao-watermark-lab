@@ -1,6 +1,6 @@
 {
   "name": "doubao-watermark-lab",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "基于 Electron 和豆包网页版的批量图片去水印工作台",
   "main": "src/main.js",
   "author": "Watermark Lab",
