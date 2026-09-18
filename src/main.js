@@ -854,15 +854,11 @@ async function broadcastLoginStatus() {
     try { persistentSession.flushStorageData(); } catch { /* 忽略持久化瞬时错误 */ }
     clearInterval(loginTimer);
     loginTimer = null;
-    // 批处理运行期间绝不销毁任何豆包窗口。旧逻辑虽然跳过 busy 窗口，
-    // 但窗口池/登录恢复切换存在极短竞态，可能把仍被异步链持有的 webContents 销毁，
-    // 最终冒出 "Object has been destroyed"。运行中只隐藏空闲窗口，批次结束后再复用/回收。
+    // V2.0 固定工作池：健康豆包窗口只隐藏、不销毁，下一张图片直接热复用。
+    // 只有真正失效的 worker 才由自愈链重建，避免频繁创建/销毁窗口增加验证概率。
     for (const window of BrowserWindow.getAllWindows()) {
       if (window === mainWindow || !windowUsesDoubaoSession(window, persistentSession) || busyWindows.has(window)) continue;
-      try {
-        window.hide();
-        if (activeBatchCount <= 0 && isDoubaoWorkerUsable(window)) window.destroy();
-      } catch { /* 窗口已损坏时由健康检查/重建链处理 */ }
+      try { window.hide(); } catch { /* 窗口已损坏时由健康检查/重建链处理 */ }
     }
     if (!isDoubaoWorkerUsable(doubaoWindow)) doubaoWindow = null;
   }
@@ -969,6 +965,7 @@ function createDoubaoWindow({ focus = true } = {}) {
       safeDialogs: true
     }
   }));
+  workerPoolState(doubaoWindow, 0);
 
   doubaoWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -1028,6 +1025,7 @@ function createAuxWorkerWindow(position) {
       safeDialogs: true
     }
   }));
+  workerPoolState(workerWindow, position + 1);
 
   workerWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -1050,6 +1048,7 @@ function createAuxWorkerWindow(position) {
   });
 
   workerWindow.on('closed', () => {
+    busyWindows.delete(workerWindow);
     auxWorkerWindows = auxWorkerWindows.filter((item) => item !== workerWindow);
   });
   workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
@@ -1065,32 +1064,66 @@ function hideIdleDoubaoWindows() {
   }
 }
 
-// 为批次分配互不冲突的豆包窗口：优先复用空闲窗口，不够时新建；批次结束后释放
-async function acquireBatchWindows(count, { show }) {
+async function ensureFixedWorkerPool(targetSize) {
+  const target = Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(Number(targetSize) || PARALLEL_WORKER_COUNT)));
+  fixedWorkerPoolTarget = target;
+
   createDoubaoWindow({ focus: false });
-  const idleWindows = () => [doubaoWindow, ...auxWorkerWindows]
-    .filter((window) => isDoubaoWorkerUsable(window) && !busyWindows.has(window));
-  const windows = [];
-  for (let index = 0; index < count; index += 1) {
-    let window = idleWindows().find((item) => !windows.includes(item));
-    if (!window) {
-      window = createAuxWorkerWindow(auxWorkerWindows.length);
-      auxWorkerWindows.push(window);
-    }
-    busyWindows.add(window);
-    // 记录原始标题，任务期间的进度标题在批次结束后还原
-    if (!window.__baseTitle) window.__baseTitle = window.getTitle();
-    windows.push(window);
+  workerPoolState(doubaoWindow, 0);
+
+  let healthy = allHealthyWorkerWindows();
+  while (healthy.length < target) {
+    const position = healthy.length;
+    const worker = createAuxWorkerWindow(Math.max(0, position - 1));
+    auxWorkerWindows.push(worker);
+    workerPoolState(worker, position);
+    healthy = allHealthyWorkerWindows();
   }
-  if (show) {
-    windows.forEach((window, index) => {
+
+  // 并发设置从大调小时，只回收超出目标且当前空闲的尾部窗口；目标数量以内的窗口长期保活。
+  const ordered = allHealthyWorkerWindows();
+  for (let index = ordered.length - 1; index >= target; index -= 1) {
+    const window = ordered[index];
+    if (busyWindows.has(window)) continue;
+    if (window === doubaoWindow) continue;
+    discardDoubaoWorker(window);
+  }
+
+  return allHealthyWorkerWindows().slice(0, target);
+}
+
+// V2.0：全局固定窗口池。批次只能租用池内窗口；池满时等待空闲，不再额外创建第 N+1 个窗口。
+async function acquireBatchWindows(count, { show, poolSize, cancelRef } = {}) {
+  const pool = await ensureFixedWorkerPool(poolSize || count);
+  const needed = Math.min(Math.max(1, Number(count) || 1), pool.length);
+  let windows = [];
+
+  while (windows.length < needed) {
+    if (cancelRef?.value) throw loginRecoveryCancelledError();
+    windows = allHealthyWorkerWindows()
+      .slice(0, fixedWorkerPoolTarget)
+      .filter((window) => !busyWindows.has(window))
+      .slice(0, needed);
+
+    if (windows.length < needed) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      continue;
+    }
+  }
+
+  windows.forEach((window, index) => {
+    busyWindows.add(window);
+    workerPoolState(window, allHealthyWorkerWindows().indexOf(window));
+    if (!window.__baseTitle) window.__baseTitle = window.getTitle();
+    if (show) {
       window.setPosition(90 + index * 56, 70 + index * 48);
       window.show();
-    });
-    if (activeBatchCount <= 1) windows[0].focus();
-  } else {
-    hideIdleDoubaoWindows();
-  }
+    }
+  });
+
+  if (show && activeBatchCount <= 1 && windows[0]) windows[0].focus();
+  if (!show) hideIdleDoubaoWindows();
+
   try {
     await Promise.all(windows.map(waitForDoubaoLoad));
   } catch (error) {
@@ -1104,8 +1137,10 @@ async function rebuildBatchWorker(slot, { show = false } = {}) {
   const previous = slot?.window || null;
   if (previous) discardDoubaoWorker(previous);
 
-  const replacement = createAuxWorkerWindow(Number(slot?.position) || 0);
+  const replacement = createAuxWorkerWindow(Math.max(0, (Number(slot?.position) || 0) - 1));
   auxWorkerWindows.push(replacement);
+  workerPoolState(replacement, Number(slot?.position) || 0);
+  resetWorkerConversationState(replacement, { forceRotate: true });
   busyWindows.add(replacement);
   if (!replacement.__baseTitle) replacement.__baseTitle = replacement.getTitle();
   if (slot) slot.window = replacement;
