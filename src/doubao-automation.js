@@ -1331,13 +1331,19 @@ class DoubaoAutomation {
     // 必须抛出 LOGIN_RECOVERY_REQUIRED 交给主调度自动恢复。
     await this.requireAuthenticated();
     let resumed = false;
+    let navigatedConversation = false;
     if (conversationId) {
       resumed = await this.openConversation(conversationId).catch(() => false);
+      navigatedConversation = resumed;
     }
-    // 历史对话接不上（已删除等）时也开新对话，避免内容发进无关会话
-    if (!resumed && (newConversation || conversationId)) await this.freshConversation();
-    // 导航后再快速确认一次，覆盖“打开历史会话时刚好跳登录页”的边界情况。
-    await this.requireAuthenticated({ force: true });
+    // 历史对话接不上（已删除等）时也开新对话，避免内容发进无关会话。
+    // V2.0 复用固定 worker 当前聊天时 newConversation=false，此时没有发生导航，
+    // 直接复用刚刚确认过的登录状态，不再每张图额外做一次强制登录探测。
+    if (!resumed && (newConversation || conversationId)) {
+      await this.freshConversation();
+      navigatedConversation = true;
+    }
+    await this.requireAuthenticated({ force: navigatedConversation });
 
     await this.attachFile(filePath);
     // 上传完成后再填提示词：实测豆包在传图期间向输入框写入文字可能触发重渲染、冲掉未完成的附件

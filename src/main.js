@@ -28,6 +28,16 @@ const {
   workerDestroyedError
 } = require('./task-retry');
 const { writeZipFile } = require('./zip-writer');
+const {
+  CONVERSATION_IMAGE_LIMIT,
+  CONVERSATION_MAX_AGE_MS,
+  conversationRotationReason,
+  dispatchSpacingMs,
+  effectiveConcurrency,
+  effectiveVerificationLevel,
+  registerVerificationCleared,
+  registerVerificationTrigger
+} = require('./worker-pool-policy');
 
 const DOUBAO_PARTITION = 'persist:watermark-lab-doubao';
 const APP_ICON_PATH = path.join(__dirname, 'assets', 'app-icon.png');
@@ -123,6 +133,14 @@ const verificationEpoch = { value: 0 };
 // 其他任务等待同一 Promise；恢复成功后 loginRecoveryEpoch 递增，通知所有受影响任务从头重跑。
 const loginRecoveryGate = { owner: null, promise: null };
 const loginRecoveryEpoch = { value: 0 };
+
+// V2.0 固定工作池：并发设置决定池大小，任务只租用池内窗口，不再按图片无限创建窗口。
+// 验证风险调度会在近期频繁触发验证时自动降并发/加大错峰，稳定 10 分钟后恢复。
+let fixedWorkerPoolTarget = PARALLEL_WORKER_COUNT;
+let activeWorkerTasks = 0;
+const workerDispatchGate = { nextAt: 0 };
+let verificationRisk = { level: 0, lastTriggeredAt: 0, cooldownUntil: 0 };
+
 let tempFileSeq = 0;
 
 // 并发批次可能同时写同一文件，临时文件名必须唯一，避免 rename 竞态
@@ -648,6 +666,109 @@ async function recoverDoubaoLogin(workerWindow, {
   }
 }
 
+function workerPoolState(browserWindow, position = 0) {
+  if (!browserWindow) return null;
+  if (!browserWindow.__watermarkWorkerPoolState) {
+    browserWindow.__watermarkWorkerPoolState = {
+      position: Math.max(0, Number(position) || 0),
+      conversationStartedAt: 0,
+      conversationImageCount: 0,
+      forceConversationRotate: true,
+      completedTasks: 0
+    };
+  } else {
+    browserWindow.__watermarkWorkerPoolState.position = Math.max(0, Number(position) || 0);
+  }
+  return browserWindow.__watermarkWorkerPoolState;
+}
+
+function resetWorkerConversationState(browserWindow, { forceRotate = true } = {}) {
+  const state = workerPoolState(browserWindow);
+  if (!state) return;
+  state.conversationStartedAt = 0;
+  state.conversationImageCount = 0;
+  state.forceConversationRotate = forceRotate;
+}
+
+function planWorkerConversation(browserWindow, now = Date.now()) {
+  const state = workerPoolState(browserWindow);
+  const reason = conversationRotationReason({
+    startedAt: state?.conversationStartedAt || 0,
+    imageCount: state?.conversationImageCount || 0,
+    forceRotate: state?.forceConversationRotate === true
+  }, now);
+  return { rotate: Boolean(reason), reason, state };
+}
+
+function markWorkerConversationStarted(browserWindow, now = Date.now()) {
+  const state = workerPoolState(browserWindow);
+  if (!state) return;
+  state.conversationStartedAt = now;
+  state.conversationImageCount = 0;
+  state.forceConversationRotate = false;
+}
+
+function markWorkerImageCompleted(browserWindow) {
+  const state = workerPoolState(browserWindow);
+  if (!state) return;
+  state.conversationImageCount += 1;
+  state.completedTasks += 1;
+}
+
+function allHealthyWorkerWindows() {
+  return [doubaoWindow, ...auxWorkerWindows]
+    .filter((window, index, items) => window && items.indexOf(window) === index)
+    .filter((window) => isDoubaoWorkerUsable(window));
+}
+
+function verificationRiskLevel() {
+  return effectiveVerificationLevel(verificationRisk, Date.now());
+}
+
+function registerVerificationRisk() {
+  verificationRisk = registerVerificationTrigger(verificationRisk, Date.now());
+  return verificationRisk;
+}
+
+function clearVerificationRisk() {
+  verificationRisk = registerVerificationCleared(verificationRisk, Date.now());
+  return verificationRisk;
+}
+
+async function waitForWorkerDispatchPermit({ slot, cancelRef, jobBase, maxConcurrent }) {
+  let lastNoticeAt = 0;
+  while (true) {
+    if (cancelRef?.value) throw loginRecoveryCancelledError();
+    const now = Date.now();
+    const level = verificationRiskLevel();
+    const allowedConcurrency = effectiveConcurrency(maxConcurrent, verificationRisk, now);
+    const coolingDown = now < (Number(verificationRisk.cooldownUntil) || 0);
+    const verificationActive = Boolean(verificationGate.owner);
+
+    if (!verificationActive && !coolingDown && activeWorkerTasks < allowedConcurrency && now >= workerDispatchGate.nextAt) {
+      activeWorkerTasks += 1;
+      workerDispatchGate.nextAt = now + dispatchSpacingMs(verificationRisk, now);
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        activeWorkerTasks = Math.max(0, activeWorkerTasks - 1);
+      };
+    }
+
+    if (jobBase && now - lastNoticeAt > 5000 && (verificationActive || coolingDown || level >= 2)) {
+      lastNoticeAt = now;
+      const message = verificationActive
+        ? '豆包正在进行安全验证，新任务已暂停派发'
+        : level >= 2
+          ? `近期验证较频繁，已自动降到最多 ${allowedConcurrency} 个新任务并发`
+          : '安全验证刚恢复，正在短暂冷却后继续';
+      batchEvent({ type: 'job-progress', ...jobBase, message });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
 function safeWebContents(browserWindow) {
   if (!browserWindow || browserWindow.isDestroyed?.()) return null;
   try {
@@ -733,15 +854,11 @@ async function broadcastLoginStatus() {
     try { persistentSession.flushStorageData(); } catch { /* 忽略持久化瞬时错误 */ }
     clearInterval(loginTimer);
     loginTimer = null;
-    // 批处理运行期间绝不销毁任何豆包窗口。旧逻辑虽然跳过 busy 窗口，
-    // 但窗口池/登录恢复切换存在极短竞态，可能把仍被异步链持有的 webContents 销毁，
-    // 最终冒出 "Object has been destroyed"。运行中只隐藏空闲窗口，批次结束后再复用/回收。
+    // V2.0 固定工作池：健康豆包窗口只隐藏、不销毁，下一张图片直接热复用。
+    // 只有真正失效的 worker 才由自愈链重建，避免频繁创建/销毁窗口增加验证概率。
     for (const window of BrowserWindow.getAllWindows()) {
       if (window === mainWindow || !windowUsesDoubaoSession(window, persistentSession) || busyWindows.has(window)) continue;
-      try {
-        window.hide();
-        if (activeBatchCount <= 0 && isDoubaoWorkerUsable(window)) window.destroy();
-      } catch { /* 窗口已损坏时由健康检查/重建链处理 */ }
+      try { window.hide(); } catch { /* 窗口已损坏时由健康检查/重建链处理 */ }
     }
     if (!isDoubaoWorkerUsable(doubaoWindow)) doubaoWindow = null;
   }
@@ -848,6 +965,7 @@ function createDoubaoWindow({ focus = true } = {}) {
       safeDialogs: true
     }
   }));
+  workerPoolState(doubaoWindow, 0);
 
   doubaoWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -907,6 +1025,7 @@ function createAuxWorkerWindow(position) {
       safeDialogs: true
     }
   }));
+  workerPoolState(workerWindow, position + 1);
 
   workerWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -929,6 +1048,7 @@ function createAuxWorkerWindow(position) {
   });
 
   workerWindow.on('closed', () => {
+    busyWindows.delete(workerWindow);
     auxWorkerWindows = auxWorkerWindows.filter((item) => item !== workerWindow);
   });
   workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
@@ -944,32 +1064,70 @@ function hideIdleDoubaoWindows() {
   }
 }
 
-// 为批次分配互不冲突的豆包窗口：优先复用空闲窗口，不够时新建；批次结束后释放
-async function acquireBatchWindows(count, { show }) {
+async function ensureFixedWorkerPool(targetSize) {
+  const target = Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(Number(targetSize) || PARALLEL_WORKER_COUNT)));
+  fixedWorkerPoolTarget = target;
+
   createDoubaoWindow({ focus: false });
-  const idleWindows = () => [doubaoWindow, ...auxWorkerWindows]
-    .filter((window) => isDoubaoWorkerUsable(window) && !busyWindows.has(window));
-  const windows = [];
-  for (let index = 0; index < count; index += 1) {
-    let window = idleWindows().find((item) => !windows.includes(item));
-    if (!window) {
-      window = createAuxWorkerWindow(auxWorkerWindows.length);
-      auxWorkerWindows.push(window);
-    }
-    busyWindows.add(window);
-    // 记录原始标题，任务期间的进度标题在批次结束后还原
-    if (!window.__baseTitle) window.__baseTitle = window.getTitle();
-    windows.push(window);
+  workerPoolState(doubaoWindow, 0);
+
+  let healthy = allHealthyWorkerWindows();
+  while (healthy.length < target) {
+    const position = healthy.length;
+    const worker = createAuxWorkerWindow(Math.max(0, position - 1));
+    auxWorkerWindows.push(worker);
+    workerPoolState(worker, position);
+    healthy = allHealthyWorkerWindows();
   }
-  if (show) {
-    windows.forEach((window, index) => {
+
+  // 并发设置从大调小时，只回收超出目标且当前空闲的尾部窗口；目标数量以内的窗口长期保活。
+  const ordered = allHealthyWorkerWindows();
+  for (let index = ordered.length - 1; index >= target; index -= 1) {
+    const window = ordered[index];
+    if (busyWindows.has(window)) continue;
+    if (window === doubaoWindow) continue;
+    discardDoubaoWorker(window);
+  }
+
+  return allHealthyWorkerWindows().slice(0, target);
+}
+
+// V2.0：全局固定窗口池。批次只能租用池内窗口；池满时等待空闲，不再额外创建第 N+1 个窗口。
+async function acquireBatchWindows(count, { show, poolSize, cancelRef } = {}) {
+  const pool = await ensureFixedWorkerPool(poolSize || count);
+  const needed = Math.min(Math.max(1, Number(count) || 1), pool.length);
+  let windows = [];
+
+  while (windows.length < needed) {
+    if (cancelRef?.value) throw loginRecoveryCancelledError();
+    let healthy = allHealthyWorkerWindows();
+    if (healthy.length < fixedWorkerPoolTarget) {
+      await ensureFixedWorkerPool(fixedWorkerPoolTarget);
+      healthy = allHealthyWorkerWindows();
+    }
+    windows = healthy
+      .filter((window) => !busyWindows.has(window))
+      .slice(0, needed);
+
+    if (windows.length < needed) {
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      continue;
+    }
+  }
+
+  windows.forEach((window, index) => {
+    busyWindows.add(window);
+    workerPoolState(window, allHealthyWorkerWindows().indexOf(window));
+    if (!window.__baseTitle) window.__baseTitle = window.getTitle();
+    if (show) {
       window.setPosition(90 + index * 56, 70 + index * 48);
       window.show();
-    });
-    if (activeBatchCount <= 1) windows[0].focus();
-  } else {
-    hideIdleDoubaoWindows();
-  }
+    }
+  });
+
+  if (show && activeBatchCount <= 1 && windows[0]) windows[0].focus();
+  if (!show) hideIdleDoubaoWindows();
+
   try {
     await Promise.all(windows.map(waitForDoubaoLoad));
   } catch (error) {
@@ -983,8 +1141,10 @@ async function rebuildBatchWorker(slot, { show = false } = {}) {
   const previous = slot?.window || null;
   if (previous) discardDoubaoWorker(previous);
 
-  const replacement = createAuxWorkerWindow(Number(slot?.position) || 0);
+  const replacement = createAuxWorkerWindow(Math.max(0, (Number(slot?.position) || 0) - 1));
   auxWorkerWindows.push(replacement);
+  workerPoolState(replacement, Number(slot?.position) || 0);
+  resetWorkerConversationState(replacement, { forceRotate: true });
   busyWindows.add(replacement);
   if (!replacement.__baseTitle) replacement.__baseTitle = replacement.getTitle();
   if (slot) slot.window = replacement;
@@ -1071,10 +1231,21 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     ? sanitizeSettings(rawSettings)
     : await saveSettings(rawSettings);
   const useParallel = mode !== 'manual' && settings.parallelProcessing && files.length > 1;
-  const windows = await acquireBatchWindows(useParallel ? Math.min(settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT, files.length) : 1, {
-    show: settings.showBrowserWindow
-  });
-  const workerSlots = windows.map((window, position) => ({ window, position }));
+  const configuredPoolSize = settings.parallelProcessing
+    ? (settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT)
+    : 1;
+  const windows = await acquireBatchWindows(
+    useParallel ? Math.min(configuredPoolSize, files.length) : 1,
+    {
+      show: settings.showBrowserWindow,
+      poolSize: configuredPoolSize,
+      cancelRef
+    }
+  );
+  const workerSlots = windows.map((window, index) => ({
+    window,
+    position: workerPoolState(window, index)?.position ?? index
+  }));
   const browser = workerSlots[0]?.window || null;
   const releaseWindows = () => workerSlots.forEach((slot) => {
     const window = slot.window;
@@ -1091,7 +1262,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     mode,
     path: runtime.eventPath || null,
     parallel: useParallel,
-    workers: useParallel ? windows.length : 1
+    workers: useParallel ? windows.length : 1,
+    workerPoolSize: fixedWorkerPoolTarget
   });
   const results = [];
 
@@ -1130,6 +1302,12 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       onVerificationRequired: () => {
         if (verificationGate.owner && verificationGate.owner !== verificationToken) return false;
         verificationGate.owner = verificationToken;
+        const risk = registerVerificationRisk();
+        batchEvent({
+          type: 'job-progress',
+          ...jobBase,
+          message: `检测到安全验证，已进入低验证调度模式（风险等级 ${risk.level}/3）`
+        });
         const focusTarget = isDoubaoWorkerUsable(workerWindow)
           ? workerWindow
           : (isDoubaoWorkerUsable(browser) ? browser : null);
@@ -1148,6 +1326,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         if (verificationGate.owner !== verificationToken) return;
         verificationGate.owner = null;
         verificationEpoch.value += 1;
+        clearVerificationRisk();
         batchEvent({ type: 'verification-cleared', ...jobBase });
         if (!settings.showBrowserWindow) {
           if (isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
@@ -1156,10 +1335,35 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       }
     });
 
-    let taskConversationId = typeof file.conversationId === 'string' ? file.conversationId : '';
-    // 同一会话不能被两个任务同时使用（无论并行任务还是并发批次），后来的任务另起新会话
+    // V2.0 普通批量任务不再按“图片历史会话”跳来跳去，而是固定复用所属 worker 当前聊天。
+    // 手动局部重绘仍可接回该图片历史会话，避免破坏已有编辑链。
+    let taskConversationId = mode === 'manual' && typeof file.conversationId === 'string'
+      ? file.conversationId
+      : '';
     if (taskConversationId && inUseConversations.has(taskConversationId)) taskConversationId = '';
     if (taskConversationId) inUseConversations.add(taskConversationId);
+
+    const conversationPlan = mode === 'manual'
+      ? { rotate: true, reason: 'manual', state: workerPoolState(workerWindow) }
+      : planWorkerConversation(workerWindow);
+    const poolState = conversationPlan.state || workerPoolState(workerWindow);
+    if (mode !== 'manual') {
+      const workerNumber = (Number(poolState?.position) || 0) + 1;
+      const reasonText = conversationPlan.reason === 'image-limit'
+        ? `已处理 ${CONVERSATION_IMAGE_LIMIT} 张`
+        : conversationPlan.reason === 'time-limit'
+          ? '当前聊天已使用约 15 分钟'
+          : conversationPlan.reason === 'forced'
+            ? '上次会话需要重置'
+            : '工作窗口首次使用';
+      batchEvent({
+        type: 'job-progress',
+        ...jobBase,
+        message: conversationPlan.rotate
+          ? `工作窗口 ${workerNumber}：${reasonText}，正在切换新聊天`
+          : `工作窗口 ${workerNumber}：继续复用当前聊天（${poolState.conversationImageCount + 1}/${CONVERSATION_IMAGE_LIMIT}）`
+      });
+    }
     let paddedUpload = null;
     const taskStartedAt = Date.now();
     const timings = {
@@ -1195,13 +1399,16 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       const firstPass = await automation.processImage({
         filePath: file.path,
         prompt: promptText,
-        // 每个任务独占一个会话：有历史会话先接回（接回失败 processImage 内会自动开新对话），
-        // 没有历史会话的一律开新对话，避免多张图串进同一会话、记录的会话 ID 互相覆盖
-        newConversation: true,
-        conversationId: taskConversationId,
+        // V2.0：普通批量任务每个 worker 最多连续处理 3 张或 15 分钟才换聊天；
+        // 单张图片内部的生成/复检/补修始终留在同一个聊天闭环。
+        newConversation: mode === 'manual' ? true : conversationPlan.rotate,
+        conversationId: mode === 'manual' ? taskConversationId : '',
         imageWaitSeconds: settings.imageWaitSeconds
       });
       timings.firstPassMs += Date.now() - firstPassStarted;
+      if (mode !== 'manual' && conversationPlan.rotate) {
+        markWorkerConversationStarted(workerWindow);
+      }
       let candidates = firstPass.candidates;
       let conversationId = firstPass.conversationId;
       let finalGenerationReadyAt = Number(firstPass.generationReadyAt) || Date.now();
@@ -1228,8 +1435,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         const secondPass = await automation.processImage({
           filePath: uploadPath,
           prompt: promptText,
-          newConversation: true,
-          conversationId: conversationId || taskConversationId,
+          newConversation: mode === 'manual',
+          conversationId: mode === 'manual' ? (conversationId || taskConversationId) : '',
           imageWaitSeconds: settings.imageWaitSeconds
         });
         timings.fallbackPassMs += Date.now() - fallbackPassStarted;
@@ -1653,6 +1860,15 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       ].filter(Boolean).join(' / ');
       batchEvent({ type: 'job-progress', ...jobBase, message: `本图耗时：${timingSummary}` });
 
+      if (mode === 'manual') {
+        resetWorkerConversationState(workerWindow, { forceRotate: true });
+      } else if (auditFallbackCount > 0) {
+        // 重新上传兜底会新建专用复检聊天，下一张图重新开一个干净聊天再进入固定复用周期。
+        resetWorkerConversationState(workerWindow, { forceRotate: true });
+      } else {
+        markWorkerImageCompleted(workerWindow);
+      }
+
       const result = {
         ...jobBase,
         ...saved,
@@ -1695,6 +1911,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         }).catch(() => {});
       }
     } catch (error) {
+      // 任何未完成任务都可能把当前聊天留在半成品状态；下一张任务强制换一个干净聊天。
+      const state = workerPoolState(workerWindow);
+      if (state) state.forceConversationRotate = true;
       error = normalizeTaskError(error);
       if (error.code === 'CANCELLED' || cancelRef.value) return;
       if (error.code === 'VERIFICATION_INTERRUPTED') return { kind: 'retry-verification', error };
@@ -1811,6 +2030,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         } else {
           await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
         }
+        resetWorkerConversationState(slot.window, { forceRotate: true });
         epochRef.login = loginRecoveryEpoch.value;
         epochRef.verification = verificationEpoch.value;
         batchEvent({
@@ -1844,13 +2064,20 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ]);
         }
 
+        resetWorkerConversationState(slot.window, { forceRotate: true });
         epochRef.verification = verificationEpoch.value;
         epochRef.login = loginRecoveryEpoch.value;
+        const retrySpacing = dispatchSpacingMs(verificationRisk, Date.now());
+        const retryCooldown = Math.max(0, (Number(verificationRisk.cooldownUntil) || 0) - Date.now());
+        const staggerMs = retryCooldown + Math.max(0, Number(slot.position) || 0) * retrySpacing;
         batchEvent({
           type: 'job-progress',
           ...common,
-          message: `安全验证已中断任务，正在重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
+          message: `安全验证已中断任务，低验证模式错峰 ${Math.ceil(staggerMs / 1000)} 秒后重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
         });
+        if (staggerMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, staggerMs));
+        }
         continue;
       }
 
@@ -1906,26 +2133,50 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
   };
 
   try {
+    const runWithDispatchPermit = async (index, slot) => {
+      const file = files[index];
+      const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
+      const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
+      const dispatchBase = {
+        index,
+        batchId,
+        path: eventPath,
+        name: path.basename(sourcePath),
+        total: files.length,
+        mode
+      };
+      const releasePermit = await waitForWorkerDispatchPermit({
+        slot,
+        cancelRef,
+        jobBase: dispatchBase,
+        maxConcurrent: configuredPoolSize
+      });
+      try {
+        await processAt(index, slot);
+      } finally {
+        releasePermit();
+      }
+    };
+
     if (!useParallel) {
       for (let index = 0; index < files.length; index += 1) {
         if (cancelRef.value) break;
-        await processAt(index, workerSlots[0]);
+        await runWithDispatchPermit(index, workerSlots[0]);
         if (index < files.length - 1 && !cancelRef.value && settings.intervalSeconds > 0) {
           batchEvent({ type: 'batch-wait', seconds: settings.intervalSeconds, nextIndex: index + 1 });
           await new Promise((resolve) => setTimeout(resolve, settings.intervalSeconds * 1000));
         }
       }
     } else {
-      // 多线程：每个工作窗口独立取任务，全部同时启动，不做人为错峰。
-      // 每个任务本身要经历开对话/上传/发送多个步骤，各窗口的请求节奏天然错开；
-      // 偶发的安全验证由批次级验证兜底机制处理（暂停 → 手动完成 → 整批自动重启）
+      // 固定工作池：每个 slot 连续接单，但新任务启动经过全局错峰门。
+      // 正常状态约 700ms 错峰；验证频繁时自动拉大到 1.5~5 秒并限制新任务并发。
       let nextIndex = 0;
       const worker = async (slot) => {
         while (!cancelRef.value) {
           const index = nextIndex;
           nextIndex += 1;
           if (index >= files.length) return;
-          await processAt(index, slot);
+          await runWithDispatchPermit(index, slot);
         }
       };
       await Promise.all(workerSlots.map((slot) => worker(slot)));
