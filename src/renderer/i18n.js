@@ -260,7 +260,6 @@
     '豆包会话恢复加载超时': 'Doubao session recovery timed out while loading',
     '等待豆包重新登录超时；当前任务未丢失，可完成登录后重新开始': 'Timed out waiting for Doubao sign-in; the task was not lost and can be restarted after signing in',
     '豆包登录会话多次恢复后仍异常，请稍后重新开始该任务': 'The Doubao login session remained abnormal after multiple recovery attempts; restart this task later',
-    '豆包工作窗口已关闭，无法自动恢复登录': 'The Doubao worker window is closed, so automatic login recovery is unavailable',
     '豆包页面响应超时，请刷新页面后重试': 'Doubao page timed out — refresh and retry',
     '等待手动完成豆包安全验证超时；请完成验证后重新开始任务': 'Timed out waiting for manual verification; complete it and restart the task',
     '豆包登录页面加载超时': 'Doubao sign-in page timed out',
