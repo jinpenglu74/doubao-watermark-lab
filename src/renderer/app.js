@@ -252,6 +252,8 @@ function progressForMessage(message, current = 0) {
   else if (resourceMatch) progress = 68 + Math.round((Number(resourceMatch[1]) / Math.max(1, Number(resourceMatch[2]))) * 14);
   else if (/原生保存|下载/.test(text)) progress = 84;
   else if (/高清预览|高清画布|生成结果画布/.test(text)) progress = 90;
+  else if (/自动定点补修/.test(text)) progress = Math.max(current, 92);
+  else if (/全图复检|残留水印/.test(text)) progress = Math.max(current, 94);
   return Math.min(96, Math.max(current, progress));
 }
 
@@ -389,6 +391,24 @@ function makeQueueItem(file, index) {
       : isFallback
         ? t('接口未拦截到无水印原图，已自动加隔离带重发并完成裁切')
         : t('接口未拦截到无水印原图，已使用页面生成结果（未加隔离带）');
+    copy.append(flag);
+  }
+  if (file.status === 'complete' && ['review', 'residual-after-max', 'audit-failed', 'repair-failed'].includes(file.residualStatus)) {
+    const flag = document.createElement('span');
+    flag.className = 'qc-flag';
+    if (file.residualStatus === 'residual-after-max') {
+      flag.textContent = t('复检：仍有疑似残留');
+      flag.title = t('自动定点补修已达到上限，仍检测到疑似残留；建议点击预览确认');
+    } else if (file.residualStatus === 'review') {
+      flag.textContent = t('复检：需人工确认');
+      flag.title = t('检测到低置信度疑似标记，为避免误删真实场景文字，未自动处理');
+    } else if (file.residualStatus === 'audit-failed') {
+      flag.textContent = t('复检：未完成');
+      flag.title = t('残留水印自动复检未完成，当前结果已保留');
+    } else {
+      flag.textContent = t('补修：未完成');
+      flag.title = t('自动定点补修未完成，已保留上一版有效结果');
+    }
     copy.append(flag);
   }
   if (file.status === 'complete' && file.qc && file.qc.verdict !== 'ok') {
@@ -581,6 +601,9 @@ function handleBatchEvent(event) {
         cropPercent: event.cropPercent,
         cropEdge: event.cropEdge,
         removedUploadPadding: event.removedUploadPadding,
+        autoRepairPasses: event.autoRepairPasses || 0,
+        residualAuditCount: event.residualAuditCount || 0,
+        residualStatus: event.residualStatus || '',
         captureSource: event.captureSource || null,
         outputWidth: event.width,
         outputHeight: event.height,
