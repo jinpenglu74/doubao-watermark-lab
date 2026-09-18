@@ -1064,11 +1064,14 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
   const windows = await acquireBatchWindows(useParallel ? Math.min(settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT, files.length) : 1, {
     show: settings.showBrowserWindow
   });
-  const browser = windows[0];
-  const releaseWindows = () => windows.forEach((window) => {
+  const workerSlots = windows.map((window, position) => ({ window, position }));
+  const browser = workerSlots[0]?.window || null;
+  const releaseWindows = () => workerSlots.forEach((slot) => {
+    const window = slot.window;
     busyWindows.delete(window);
-    // 还原任务期间显示进度的窗口标题
-    if (!window.isDestroyed() && window.__baseTitle) window.setTitle(window.__baseTitle);
+    if (isDoubaoWorkerUsable(window) && window.__baseTitle) {
+      try { window.setTitle(window.__baseTitle); } catch {}
+    }
   });
 
   batchEvent({
@@ -1117,8 +1120,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       onVerificationRequired: () => {
         if (verificationGate.owner && verificationGate.owner !== verificationToken) return false;
         verificationGate.owner = verificationToken;
-        const focusTarget = (workerWindow && !workerWindow.isDestroyed() && workerWindow) || browser;
-        if (focusTarget && !focusTarget.isDestroyed()) {
+        const focusTarget = isDoubaoWorkerUsable(workerWindow)
+          ? workerWindow
+          : (isDoubaoWorkerUsable(browser) ? browser : null);
+        if (focusTarget) {
           if (focusTarget.isMinimized()) focusTarget.restore();
           focusTarget.show();
           focusTarget.moveTop();
