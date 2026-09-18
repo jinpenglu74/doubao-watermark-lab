@@ -286,6 +286,12 @@ function sanitizeQueueRecord(record = {}) {
     cropPercent: Math.max(0, Number(record.cropPercent) || 0),
     cropEdge: record.cropEdge === 'bottom' ? 'bottom' : 'top',
     removedUploadPadding: Boolean(record.removedUploadPadding),
+    autoRepairPasses: Math.min(2, Math.max(0, Math.round(Number(record.autoRepairPasses) || 0))),
+    residualAuditCount: Math.min(3, Math.max(0, Math.round(Number(record.residualAuditCount) || 0))),
+    residualStatus: [
+      'manual-skip', 'checking', 'clean', 'repaired-clean', 'review',
+      'residual-after-max', 'audit-failed', 'repair-failed', 'repaired-pending-audit'
+    ].includes(record.residualStatus) ? record.residualStatus : '',
     // 采集来源随队列持久化，重启后「直取原图/降级裁切/页面采集」徽标仍在
     captureSource: ['api-raw', 'network', 'dom', 'canvas', 'canvas-screenshot', 'editor-download'].includes(record.captureSource)
       ? record.captureSource
