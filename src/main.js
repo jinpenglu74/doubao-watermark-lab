@@ -1595,7 +1595,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         `复检 ${seconds(timings.auditMs)}秒`,
         timings.repairMs > 0 ? `补修 ${seconds(timings.repairMs)}秒` : '',
         settings.overwriteOriginal ? `质检 ${seconds(timings.qcMs)}秒` : '质检 后台',
-        `复检模式 同会话${auditFallbackCount > 0 ? `/回退${auditFallbackCount}次` : ''}`,
+        mode === 'manual'
+          ? '复检模式 手动跳过'
+          : `复检模式 同会话${auditFallbackCount > 0 ? `/回退${auditFallbackCount}次` : ''}`,
         `总计 ${seconds(timings.totalMs)}秒`
       ].filter(Boolean).join(' / ');
       batchEvent({ type: 'job-progress', ...jobBase, message: `本图耗时：${timingSummary}` });
