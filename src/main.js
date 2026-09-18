@@ -1481,16 +1481,23 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         }
       }
 
-      // 最终像素质检必须在覆盖原图之前完成；只有“残留复检通过 + 像素质检正常”才允许替换。
+      // QC 已和第一次残留复检并行启动。只有开启“覆盖原图”时才同步等待，
+      // 因为此时 QC 是允许覆盖的安全门；普通保存模式则先完成任务，QC 在后台补回结果。
+      if (!qcPromise || qcTargetPath !== saved.path) qcPromise = launchQc(saved.path);
       let finalQc = null;
-      try {
-        finalQc = await runQcCheck(sourcePath, saved.path);
-      } catch (qcError) {
-        batchEvent({
-          type: 'job-progress',
-          ...jobBase,
-          message: `最终质检未完成：${qcError.message || qcError}；不会覆盖原图`
-        });
+      let finalQcError = null;
+      if (settings.overwriteOriginal) {
+        const qcOutcome = await qcPromise;
+        timings.qcMs = qcOutcome.elapsedMs || 0;
+        finalQc = qcOutcome.qc;
+        finalQcError = qcOutcome.error;
+        if (finalQcError) {
+          batchEvent({
+            type: 'job-progress',
+            ...jobBase,
+            message: `最终质检未完成：${finalQcError.message || finalQcError}；不会覆盖原图`
+          });
+        }
       }
 
       let overwriteStatus = settings.overwriteOriginal ? 'blocked-qc' : 'disabled';
@@ -1549,12 +1556,26 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         batchEvent({ type: 'job-progress', ...jobBase, message: reasonMessage });
       }
 
+      timings.totalMs = Date.now() - taskStartedAt;
+      const seconds = (ms) => (Math.max(0, Number(ms) || 0) / 1000).toFixed(1);
+      const timingSummary = [
+        `首次处理 ${seconds(timings.firstPassMs)}秒`,
+        timings.fallbackPassMs > 0 ? `降级重发 ${seconds(timings.fallbackPassMs)}秒` : '',
+        `复检 ${seconds(timings.auditMs)}秒`,
+        timings.repairMs > 0 ? `补修 ${seconds(timings.repairMs)}秒` : '',
+        settings.overwriteOriginal ? `质检 ${seconds(timings.qcMs)}秒` : '质检 后台',
+        `总计 ${seconds(timings.totalMs)}秒`
+      ].filter(Boolean).join(' / ');
+      batchEvent({ type: 'job-progress', ...jobBase, message: `本图耗时：${timingSummary}` });
+
       const result = {
         ...jobBase,
         ...saved,
         autoRepairPasses,
         residualAuditCount,
         residualStatus,
+        timings,
+        timingSummary,
         overwroteOriginal,
         overwriteStatus,
         ...(refreshedSource ? { refreshedSource } : {}),
@@ -1565,8 +1586,23 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       };
       results.push(result);
       batchEvent({ type: 'job-complete', ...result });
-      if (finalQc) {
-        batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc });
+      if (settings.overwriteOriginal) {
+        if (finalQc) {
+          batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc, qcElapsedMs: timings.qcMs });
+        }
+      } else {
+        // 不开启覆盖原图时，不再让本地 QC 阻塞“完成”。QC 结束后只补发质检事件。
+        const backgroundOutputPath = saved.path;
+        qcPromise.then((qcOutcome) => {
+          if (!qcOutcome?.qc) return;
+          batchEvent({
+            type: 'job-qc',
+            ...jobBase,
+            outputPath: backgroundOutputPath,
+            qc: qcOutcome.qc,
+            qcElapsedMs: qcOutcome.elapsedMs || 0
+          });
+        }).catch(() => {});
       }
     } catch (error) {
       error = normalizeTaskError(error);
