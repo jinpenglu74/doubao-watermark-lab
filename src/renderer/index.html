@@ -112,6 +112,17 @@
               </button>
             </div>
 
+            <div class="setting-row switch-row overwrite-original-setting">
+              <div>
+                <strong>覆盖原图</strong>
+                <span>通过最终复检和质检后安全替换原文件；异常结果不会覆盖</span>
+              </div>
+              <label class="switch">
+                <input id="overwriteOriginal" type="checkbox">
+                <span></span>
+              </label>
+            </div>
+
             <div class="setting-row switch-row debug-window-setting">
               <div>
                 <strong>显示豆包处理窗口</strong>
@@ -169,7 +180,7 @@
                 <span id="outputPath">请选择文件夹</span>
                 <em>更改</em>
               </button>
-              <div class="output-hint">处理完成的图片会自动保存到这里</div>
+              <div id="outputHint" class="output-hint">处理完成的图片会自动保存到这里</div>
             </div>
           </div>
 
