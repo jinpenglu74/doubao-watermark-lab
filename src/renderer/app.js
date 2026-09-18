@@ -31,6 +31,7 @@ const elements = {
   maxConcurrentTasks: document.querySelector('#maxConcurrentTasks'),
   strategySummaryText: document.querySelector('#strategySummaryText'),
   advancedSettingsButton: document.querySelector('#advancedSettingsButton'),
+  overwriteOriginal: document.querySelector('#overwriteOriginal'),
   showBrowserWindow: document.querySelector('#showBrowserWindow'),
   themeModeButtons: [...document.querySelectorAll('[data-theme-mode]')],
   languageButtons: [...document.querySelectorAll('[data-language]')],
@@ -42,6 +43,7 @@ const elements = {
   appearanceColors: document.querySelector('#appearanceColors'),
   outputButton: document.querySelector('#outputButton'),
   outputPath: document.querySelector('#outputPath'),
+  outputHint: document.querySelector('#outputHint'),
   openOutputButton: document.querySelector('#openOutputButton'),
   exportZipButton: document.querySelector('#exportZipButton'),
   cancelButton: document.querySelector('#cancelButton'),
@@ -75,6 +77,7 @@ function readSettings() {
     ...state.settings,
     outputDirectory: state.settings.outputDirectory,
     showBrowserWindow: elements.showBrowserWindow.checked,
+    overwriteOriginal: elements.overwriteOriginal.checked,
     intervalSeconds: Math.min(600, Math.max(0, Math.round(Number(elements.intervalSeconds.value) || 0))),
     imageWaitSeconds: Math.min(300, Math.max(5, Math.round(Number(elements.imageWaitSeconds.value) || 60))),
     parallelProcessing: elements.parallelProcessing.checked,
@@ -95,6 +98,7 @@ function applySettings(settings) {
   state.settings = settings;
   applyAppearance(settings);
   elements.showBrowserWindow.checked = settings.showBrowserWindow;
+  elements.overwriteOriginal.checked = settings.overwriteOriginal === true;
   elements.intervalSeconds.value = String(settings.intervalSeconds ?? 30);
   elements.imageWaitSeconds.value = String(settings.imageWaitSeconds ?? 60);
   elements.parallelProcessing.checked = settings.parallelProcessing === true;
@@ -102,6 +106,9 @@ function applySettings(settings) {
   syncProcessingControls();
   elements.outputPath.textContent = settings.outputDirectory;
   elements.outputPath.title = settings.outputDirectory;
+  elements.outputHint.textContent = settings.overwriteOriginal
+    ? t('通过最终复检和质检的图片会安全覆盖原文件；未通过的结果仍保存在输出目录')
+    : t('处理完成的图片会自动保存到这里');
   const edgeName = settings.cropEdge === 'bottom' ? t('底部') : t('顶部');
   elements.strategySummaryText.textContent = t('{edge}添加 {p} 临时隔离带，白边补偿 {q}。', {
     edge: edgeName,
@@ -254,11 +261,13 @@ function progressForMessage(message, current = 0) {
   else if (/高清预览|高清画布|生成结果画布/.test(text)) progress = 90;
   else if (/自动定点补修/.test(text)) progress = Math.max(current, 92);
   else if (/全图复检|残留水印/.test(text)) progress = Math.max(current, 94);
+  else if (/安全覆盖原图|覆盖原图/.test(text)) progress = Math.max(current, 97);
   return Math.min(96, Math.max(current, progress));
 }
 
 function syncProcessingControls() {
   elements.parallelProcessing.disabled = state.running;
+  elements.overwriteOriginal.disabled = state.running;
   elements.imageWaitSeconds.disabled = state.running;
   elements.intervalSeconds.disabled = state.running || elements.parallelProcessing.checked;
   elements.maxConcurrentControl.classList.toggle('is-hidden', !elements.parallelProcessing.checked);
@@ -391,6 +400,27 @@ function makeQueueItem(file, index) {
       : isFallback
         ? t('接口未拦截到无水印原图，已自动加隔离带重发并完成裁切')
         : t('接口未拦截到无水印原图，已使用页面生成结果（未加隔离带）');
+    copy.append(flag);
+  }
+  if (file.status === 'complete' && file.overwriteStatus && file.overwriteStatus !== 'disabled') {
+    const flag = document.createElement('span');
+    if (file.overwriteStatus === 'overwritten') {
+      flag.className = 'capture-flag is-raw';
+      flag.textContent = t('已覆盖原图');
+      flag.title = t('最终复检和像素质检均通过，已安全替换原文件');
+    } else {
+      flag.className = 'qc-flag';
+      const overwriteLabels = {
+        'manual-skip': ['未覆盖：手动重绘', '手动涂抹重绘不会自动覆盖原图，结果保留在输出目录'],
+        'blocked-residual': ['未覆盖：复检未通过', '残留水印最终复检未通过，为保护原文件没有覆盖'],
+        'blocked-qc': ['未覆盖：质检未通过', '最终像素质检未通过，为保护原文件没有覆盖'],
+        'unsupported-format': ['未覆盖：格式限制', '当前原图格式无法安全保持原格式覆盖，结果保留在输出目录'],
+        failed: ['未覆盖：替换失败', '安全替换原文件失败，原图保持不变，结果保留在输出目录']
+      };
+      const detail = overwriteLabels[file.overwriteStatus] || ['未覆盖原图', '原图保持不变'];
+      flag.textContent = t(detail[0]);
+      flag.title = t(detail[1]);
+    }
     copy.append(flag);
   }
   if (file.status === 'complete' && ['review', 'residual-after-max', 'audit-failed', 'repair-failed'].includes(file.residualStatus)) {
@@ -604,11 +634,20 @@ function handleBatchEvent(event) {
         autoRepairPasses: event.autoRepairPasses || 0,
         residualAuditCount: event.residualAuditCount || 0,
         residualStatus: event.residualStatus || '',
+        overwroteOriginal: event.overwroteOriginal === true,
+        overwriteStatus: event.overwriteStatus || '',
+        ...(event.refreshedSource ? {
+          bytes: event.refreshedSource.bytes,
+          width: event.refreshedSource.width,
+          height: event.refreshedSource.height,
+          thumbnail: event.refreshedSource.thumbnail
+        } : {}),
         captureSource: event.captureSource || null,
         outputWidth: event.width,
         outputHeight: event.height,
         progress: 100
       });
+      if (event.overwroteOriginal) thumbPreviewCache.delete(source.path);
       renderQueue();
       persistQueueNow().catch((error) => console.error('保存完成记录失败', error));
     }
@@ -786,6 +825,18 @@ elements.selectAllCheckbox.addEventListener('change', () => {
   renderQueue();
 });
 
+elements.overwriteOriginal.addEventListener('change', async () => {
+  if (elements.overwriteOriginal.checked && !state.settings?.overwriteOriginalConfirmed) {
+    const confirmed = window.confirm(t('开启“覆盖原图”后，只有通过最终残留复检和像素质检的处理结果才会替换原文件；处理失败、存在疑似残留或质检异常时不会覆盖。是否继续？'));
+    if (!confirmed) {
+      elements.overwriteOriginal.checked = false;
+      return;
+    }
+    state.settings = { ...state.settings, overwriteOriginalConfirmed: true };
+  }
+  state.settings = await api.saveSettings(readSettings());
+  applySettings(state.settings);
+});
 elements.showBrowserWindow.addEventListener('change', scheduleSettingsSave);
 elements.intervalSeconds.addEventListener('change', scheduleSettingsSave);
 elements.imageWaitSeconds.addEventListener('change', scheduleSettingsSave);
