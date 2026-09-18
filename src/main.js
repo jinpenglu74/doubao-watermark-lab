@@ -517,11 +517,23 @@ async function recoverDoubaoLogin(workerWindow, {
 
   if (loginRecoveryGate.promise) {
     progress('另一个任务正在恢复豆包登录，本任务已暂停等待');
-    const result = await waitForSharedLoginRecovery(loginRecoveryGate.promise, cancelRef);
-    if (workerWindow && !workerWindow.isDestroyed()) {
-      await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
+    try {
+      const result = await waitForSharedLoginRecovery(loginRecoveryGate.promise, cancelRef);
+      if (workerWindow && !workerWindow.isDestroyed()) {
+        await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
+      }
+      return result;
+    } catch (error) {
+      // 若领头任务恰好被用户单独取消，其他仍在运行的批次不能跟着被取消；
+      // 等共享恢复槽释放后，由本任务接棒重新执行恢复。
+      if (error?.code === 'CANCELLED' && !cancelRef?.value) {
+        while (loginRecoveryGate.promise) {
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        return recoverDoubaoLogin(workerWindow, { cancelRef, jobBase, keepVisible });
+      }
+      throw error;
     }
-    return result;
   }
 
   const token = { startedAt: Date.now() };
@@ -582,7 +594,7 @@ async function recoverDoubaoLogin(workerWindow, {
       const current = await loginAutomation.getLoginStatus().catch(() => null);
       if (current?.state === 'authenticated') {
         loginFlowActive = false;
-        await workerWindow.webContents.session.flushStorageData().catch(() => {});
+        try { workerWindow.webContents.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
         if (!keepVisible && !workerWindow.isDestroyed()) workerWindow.hide();
         progress('登录会话已恢复，正在重新开始任务');
         return { recovered: true, stage: 'interactive-login' };
@@ -596,13 +608,16 @@ async function recoverDoubaoLogin(workerWindow, {
   })();
 
   loginRecoveryGate.promise = recoveryPromise;
+  let recoverySucceeded = false;
   try {
     const result = await recoveryPromise;
+    recoverySucceeded = true;
     loginRecoveryEpoch.value += 1;
     await broadcastLoginStatus().catch(() => {});
     return result;
   } finally {
     if (loginRecoveryGate.owner === token) {
+      if (!recoverySucceeded) loginFlowActive = false;
       loginRecoveryGate.owner = null;
       loginRecoveryGate.promise = null;
     }
