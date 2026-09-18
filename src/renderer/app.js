@@ -254,6 +254,7 @@ function progressForMessage(message, current = 0) {
   else if (/临时空白|添加.*空白/.test(text)) progress = 14;
   else if (/上传原图/.test(text)) progress = 24;
   else if (/填写处理指令/.test(text)) progress = 34;
+  else if (/登录状态异常|恢复豆包登录|刷新豆包会话|重置豆包工作窗口|需要重新登录|登录会话已恢复|会话已自动恢复|登录状态正常/.test(text)) progress = Math.max(current, 10);
   else if (/安全验证/.test(text)) progress = Math.max(current, 42);
   else if (/重绘图片/.test(text)) progress = 56;
   else if (resourceMatch) progress = 68 + Math.round((Number(resourceMatch[1]) / Math.max(1, Number(resourceMatch[2]))) * 14);
@@ -278,7 +279,9 @@ function syncActionState() {
   const selectedCount = state.files.filter((file) => file.selected !== false).length;
   elements.queueCount.textContent = t('{n} 张', { n: state.files.length });
   elements.startCount.textContent = String(selectedCount);
-  elements.startButton.disabled = state.running || !selectedCount || !state.loggedIn;
+  // 即使当前检测为未登录也允许启动：主进程会自动恢复持久会话，
+  // 真正需要扫码/短信时暂停任务并弹出唯一登录窗口，登录成功后自动续跑。
+  elements.startButton.disabled = state.running || !selectedCount;
   elements.clearButton.disabled = state.running || !state.files.length;
   elements.dropZone.disabled = state.running;
   elements.selectAllCheckbox.disabled = state.running || !state.files.length;
