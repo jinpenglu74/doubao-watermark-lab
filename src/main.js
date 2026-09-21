@@ -16,28 +16,9 @@ const {
   saveProcessedImage,
   watermarkRegionsToStrokes
 } = require('./image-pipeline');
-const { buildManualEditPrompt, buildPrompt, buildSameConversationWatermarkAuditPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
+const { buildManualEditPrompt, buildPrompt, buildWatermarkAuditPrompt, DEFAULT_PROMPT, DEFAULT_PROMPT_EN, MANUAL_EDIT_PROMPT, MANUAL_EDIT_PROMPT_EN } = require('./prompt');
 const { overwriteGuard, replaceOriginalSafely } = require('./original-overwrite');
-const {
-  MAX_AUTO_RETRIES,
-  exhaustedRetryMessage,
-  isDestroyedObjectError,
-  normalizeTaskError,
-  retryProgressMessage,
-  shouldAutoRetryTaskError,
-  workerDestroyedError
-} = require('./task-retry');
 const { writeZipFile } = require('./zip-writer');
-const {
-  CONVERSATION_IMAGE_LIMIT,
-  CONVERSATION_MAX_AGE_MS,
-  conversationRotationReason,
-  dispatchSpacingMs,
-  effectiveConcurrency,
-  effectiveVerificationLevel,
-  registerVerificationCleared,
-  registerVerificationTrigger
-} = require('./worker-pool-policy');
 
 const DOUBAO_PARTITION = 'persist:watermark-lab-doubao';
 const APP_ICON_PATH = path.join(__dirname, 'assets', 'app-icon.png');
@@ -133,14 +114,6 @@ const verificationEpoch = { value: 0 };
 // 其他任务等待同一 Promise；恢复成功后 loginRecoveryEpoch 递增，通知所有受影响任务从头重跑。
 const loginRecoveryGate = { owner: null, promise: null };
 const loginRecoveryEpoch = { value: 0 };
-
-// V2.0 固定工作池：并发设置决定池大小，任务只租用池内窗口，不再按图片无限创建窗口。
-// 验证风险调度会在近期频繁触发验证时自动降并发/加大错峰，稳定 10 分钟后恢复。
-let fixedWorkerPoolTarget = PARALLEL_WORKER_COUNT;
-let activeWorkerTasks = 0;
-const workerDispatchGate = { nextAt: 0 };
-let verificationRisk = { level: 0, lastTriggeredAt: 0, cooldownUntil: 0 };
-
 let tempFileSeq = 0;
 
 // 并发批次可能同时写同一文件，临时文件名必须唯一，避免 rename 竞态
@@ -475,8 +448,7 @@ async function cookieLoginHint() {
 async function getLoginStatus() {
   const cookieHint = await cookieLoginHint();
   let pageStatus = null;
-  const loginContents = safeWebContents(doubaoWindow);
-  if (isDoubaoWorkerUsable(doubaoWindow) && loginContents && !loginContents.isLoading()) {
+  if (doubaoWindow && !doubaoWindow.isDestroyed() && !doubaoWindow.webContents.isLoading()) {
     try {
       const automation = new DoubaoAutomation(doubaoWindow);
       pageStatus = await automation.getLoginStatus();
@@ -516,9 +488,9 @@ async function waitForSharedLoginRecovery(promise, cancelRef) {
 }
 
 async function loadDoubaoChatForRecovery(workerWindow) {
-  if (!isDoubaoWorkerUsable(workerWindow)) {
-    const error = workerDestroyedError();
-    error.code = 'WORKER_DESTROYED';
+  if (!workerWindow || workerWindow.isDestroyed()) {
+    const error = new Error('豆包工作窗口已关闭，无法自动恢复登录');
+    error.code = 'LOGIN_RECOVERY_FAILED';
     throw error;
   }
   await Promise.race([
@@ -538,8 +510,8 @@ async function recoverDoubaoLogin(workerWindow, {
 } = {}) {
   const progress = (message) => {
     if (jobBase) batchEvent({ type: 'job-progress', ...jobBase, message });
-    if (isDoubaoWorkerUsable(workerWindow)) {
-      try { workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`); } catch {}
+    if (workerWindow && !workerWindow.isDestroyed()) {
+      workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`);
     }
   };
 
@@ -547,7 +519,7 @@ async function recoverDoubaoLogin(workerWindow, {
     progress('另一个任务正在恢复豆包登录，本任务已暂停等待');
     try {
       const result = await waitForSharedLoginRecovery(loginRecoveryGate.promise, cancelRef);
-      if (isDoubaoWorkerUsable(workerWindow)) {
+      if (workerWindow && !workerWindow.isDestroyed()) {
         await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
       }
       return result;
@@ -622,8 +594,8 @@ async function recoverDoubaoLogin(workerWindow, {
       const current = await loginAutomation.getLoginStatus().catch(() => null);
       if (current?.state === 'authenticated') {
         loginFlowActive = false;
-        try { safeWebContents(workerWindow)?.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
-        if (!keepVisible && isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
+        try { workerWindow.webContents.session.flushStorageData(); } catch { /* 持久化失败不阻塞恢复 */ }
+        if (!keepVisible && !workerWindow.isDestroyed()) workerWindow.hide();
         progress('登录会话已恢复，正在重新开始任务');
         return { recovered: true, stage: 'interactive-login' };
       }
@@ -666,227 +638,42 @@ async function recoverDoubaoLogin(workerWindow, {
   }
 }
 
-function workerPoolState(browserWindow, position = 0) {
-  if (!browserWindow) return null;
-  if (!browserWindow.__watermarkWorkerPoolState) {
-    browserWindow.__watermarkWorkerPoolState = {
-      position: Math.max(0, Number(position) || 0),
-      conversationStartedAt: 0,
-      conversationImageCount: 0,
-      forceConversationRotate: true,
-      completedTasks: 0
-    };
-  } else {
-    browserWindow.__watermarkWorkerPoolState.position = Math.max(0, Number(position) || 0);
-  }
-  return browserWindow.__watermarkWorkerPoolState;
-}
-
-function resetWorkerConversationState(browserWindow, { forceRotate = true } = {}) {
-  const state = workerPoolState(browserWindow);
-  if (!state) return;
-  state.conversationStartedAt = 0;
-  state.conversationImageCount = 0;
-  state.forceConversationRotate = forceRotate;
-}
-
-function planWorkerConversation(browserWindow, now = Date.now()) {
-  const state = workerPoolState(browserWindow);
-  const reason = conversationRotationReason({
-    startedAt: state?.conversationStartedAt || 0,
-    imageCount: state?.conversationImageCount || 0,
-    forceRotate: state?.forceConversationRotate === true
-  }, now);
-  return { rotate: Boolean(reason), reason, state };
-}
-
-function markWorkerConversationStarted(browserWindow, now = Date.now()) {
-  const state = workerPoolState(browserWindow);
-  if (!state) return;
-  state.conversationStartedAt = now;
-  state.conversationImageCount = 0;
-  state.forceConversationRotate = false;
-}
-
-function markWorkerImageCompleted(browserWindow) {
-  const state = workerPoolState(browserWindow);
-  if (!state) return;
-  state.conversationImageCount += 1;
-  state.completedTasks += 1;
-}
-
-function allHealthyWorkerWindows() {
-  return [doubaoWindow, ...auxWorkerWindows]
-    .filter((window, index, items) => window && items.indexOf(window) === index)
-    .filter((window) => isDoubaoWorkerUsable(window));
-}
-
-function verificationRiskLevel() {
-  return effectiveVerificationLevel(verificationRisk, Date.now());
-}
-
-function registerVerificationRisk() {
-  verificationRisk = registerVerificationTrigger(verificationRisk, Date.now());
-  return verificationRisk;
-}
-
-function clearVerificationRisk() {
-  verificationRisk = registerVerificationCleared(verificationRisk, Date.now());
-  return verificationRisk;
-}
-
-async function waitForWorkerDispatchPermit({ slot, cancelRef, jobBase, maxConcurrent }) {
-  let lastNoticeAt = 0;
-  while (true) {
-    if (cancelRef?.value) throw loginRecoveryCancelledError();
-    const now = Date.now();
-    const level = verificationRiskLevel();
-    const allowedConcurrency = effectiveConcurrency(maxConcurrent, verificationRisk, now);
-    const coolingDown = now < (Number(verificationRisk.cooldownUntil) || 0);
-    const verificationActive = Boolean(verificationGate.owner);
-
-    if (!verificationActive && !coolingDown && activeWorkerTasks < allowedConcurrency && now >= workerDispatchGate.nextAt) {
-      activeWorkerTasks += 1;
-      workerDispatchGate.nextAt = now + dispatchSpacingMs(verificationRisk, now);
-      let released = false;
-      return () => {
-        if (released) return;
-        released = true;
-        activeWorkerTasks = Math.max(0, activeWorkerTasks - 1);
-      };
-    }
-
-    if (jobBase && now - lastNoticeAt > 5000 && (verificationActive || coolingDown || level >= 2)) {
-      lastNoticeAt = now;
-      const message = verificationActive
-        ? '豆包正在进行安全验证，新任务已暂停派发'
-        : level >= 2
-          ? `近期验证较频繁，已自动降到最多 ${allowedConcurrency} 个新任务并发`
-          : '安全验证刚恢复，正在短暂冷却后继续';
-      batchEvent({ type: 'job-progress', ...jobBase, message });
-    }
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-}
-
-function safeWebContents(browserWindow) {
-  if (!browserWindow || browserWindow.isDestroyed?.()) return null;
-  try {
-    const contents = browserWindow.webContents;
-    return contents && !contents.isDestroyed?.() ? contents : null;
-  } catch {
-    return null;
-  }
-}
-
-function isDoubaoWorkerUsable(browserWindow) {
-  const contents = safeWebContents(browserWindow);
-  return Boolean(contents && !browserWindow.__workerDead && !browserWindow.__workerUnresponsive);
-}
-
-function doubaoWorkerSession(browserWindow) {
-  const contents = safeWebContents(browserWindow);
-  if (!contents) throw workerDestroyedError();
-  try {
-    return contents.session;
-  } catch (error) {
-    throw normalizeTaskError(error);
-  }
-}
-
-function windowUsesDoubaoSession(browserWindow, persistentSession) {
-  const contents = safeWebContents(browserWindow);
-  if (!contents) return false;
-  try {
-    return contents.session === persistentSession;
-  } catch {
-    return false;
-  }
-}
-
-function bindDoubaoWorkerHealth(browserWindow) {
-  if (!browserWindow || browserWindow.__workerHealthBound) return browserWindow;
-  browserWindow.__workerHealthBound = true;
-  browserWindow.__workerDead = false;
-  browserWindow.__workerUnresponsive = false;
-  browserWindow.__workerFailureReason = '';
-
-  const contents = safeWebContents(browserWindow);
-  if (contents) {
-    contents.on('render-process-gone', (_event, details = {}) => {
-      browserWindow.__workerDead = true;
-      browserWindow.__workerFailureReason = `render-process-gone:${details.reason || 'unknown'}`;
-    });
-    contents.on('destroyed', () => {
-      browserWindow.__workerDead = true;
-      browserWindow.__workerFailureReason = 'webContents-destroyed';
-    });
-  }
-  browserWindow.on('unresponsive', () => {
-    browserWindow.__workerUnresponsive = true;
-    browserWindow.__workerFailureReason = 'unresponsive';
-  });
-  browserWindow.on('responsive', () => {
-    if (!browserWindow.__workerDead) {
-      browserWindow.__workerUnresponsive = false;
-      browserWindow.__workerFailureReason = '';
-    }
-  });
-  return browserWindow;
-}
-
-function discardDoubaoWorker(browserWindow) {
-  if (!browserWindow) return;
-  busyWindows.delete(browserWindow);
-  auxWorkerWindows = auxWorkerWindows.filter((item) => item !== browserWindow);
-  if (doubaoWindow === browserWindow) doubaoWindow = null;
-  try {
-    if (!browserWindow.isDestroyed?.()) browserWindow.destroy();
-  } catch { /* 已损坏的 Electron 对象无需再次处理 */ }
-}
-
 async function broadcastLoginStatus() {
   const status = await getLoginStatus();
   sendToRenderer('login:status', status);
   if (loginFlowActive && status.loggedIn) {
     loginFlowActive = false;
     const persistentSession = session.fromPartition(DOUBAO_PARTITION);
-    try { persistentSession.flushStorageData(); } catch { /* 忽略持久化瞬时错误 */ }
+    persistentSession.flushStorageData();
     clearInterval(loginTimer);
     loginTimer = null;
-    // V2.0 固定工作池：健康豆包窗口只隐藏、不销毁，下一张图片直接热复用。
-    // 只有真正失效的 worker 才由自愈链重建，避免频繁创建/销毁窗口增加验证概率。
+    // 只收掉空闲的豆包窗口；正被批次占用（busy）的窗口不能销毁，否则并发中的任务会被打断
     for (const window of BrowserWindow.getAllWindows()) {
-      if (window === mainWindow || !windowUsesDoubaoSession(window, persistentSession) || busyWindows.has(window)) continue;
-      try { window.hide(); } catch { /* 窗口已损坏时由健康检查/重建链处理 */ }
+      if (window !== mainWindow && !window.isDestroyed()
+        && window.webContents.session === persistentSession && !busyWindows.has(window)) {
+        window.hide();
+        window.destroy();
+      }
     }
-    if (!isDoubaoWorkerUsable(doubaoWindow)) doubaoWindow = null;
+    if (!doubaoWindow || doubaoWindow.isDestroyed()) doubaoWindow = null;
   }
 }
 
 async function waitForDoubaoLoad(browser) {
-  if (!isDoubaoWorkerUsable(browser)) throw workerDestroyedError();
-  const contents = safeWebContents(browser);
-  if (!contents) throw workerDestroyedError();
-  if (!contents.isLoading()) return;
+  if (!browser.webContents.isLoading()) return;
   await new Promise((resolve, reject) => {
     const cleanup = () => {
       clearTimeout(timer);
-      try { contents.removeListener('did-finish-load', onFinish); } catch {}
-      try { contents.removeListener('did-fail-load', onFail); } catch {}
-      try { contents.removeListener('destroyed', onDestroyed); } catch {}
+      browser.webContents.removeListener('did-finish-load', onFinish);
+      browser.webContents.removeListener('did-fail-load', onFail);
     };
     const onFinish = () => {
       cleanup();
       resolve();
     };
-    const onDestroyed = () => {
-      cleanup();
-      reject(workerDestroyedError());
-    };
     // 加载失败（断网、DNS 失败等）立即报错，不再干等超时；子资源失败（isMainFrame=false）忽略
     const onFail = (_event, errorCode, errorDescription, _url, isMainFrame) => {
-      if (!isMainFrame || errorCode === -3) return;
+      if (!isMainFrame || errorCode === -3) return; // -3 = ERR_ABORTED，页面内部跳转常见，忽略
       cleanup();
       reject(new Error(`豆包页面加载失败（${errorDescription || errorCode}），请检查网络后重试`));
     };
@@ -894,9 +681,8 @@ async function waitForDoubaoLoad(browser) {
       cleanup();
       reject(new Error('豆包页面加载超时'));
     }, 35_000);
-    contents.on('did-finish-load', onFinish);
-    contents.on('did-fail-load', onFail);
-    contents.once('destroyed', onDestroyed);
+    browser.webContents.on('did-finish-load', onFinish);
+    browser.webContents.on('did-fail-load', onFail);
   });
 }
 
@@ -922,8 +708,8 @@ async function logoutDoubao() {
 
   const persistentSession = session.fromPartition(DOUBAO_PARTITION);
   for (const window of BrowserWindow.getAllWindows()) {
-    if (window !== mainWindow && windowUsesDoubaoSession(window, persistentSession)) {
-      try { window.destroy(); } catch {}
+    if (window !== mainWindow && !window.isDestroyed() && window.webContents.session === persistentSession) {
+      window.destroy();
     }
   }
   doubaoWindow = null;
@@ -941,14 +727,13 @@ async function logoutDoubao() {
 }
 
 function createDoubaoWindow({ focus = true } = {}) {
-  if (doubaoWindow && isDoubaoWorkerUsable(doubaoWindow)) {
+  if (doubaoWindow && !doubaoWindow.isDestroyed()) {
     if (focus) doubaoWindow.show();
     return doubaoWindow;
   }
-  if (doubaoWindow) discardDoubaoWorker(doubaoWindow);
 
   configureDoubaoSession();
-  doubaoWindow = bindDoubaoWorkerHealth(new BrowserWindow({
+  doubaoWindow = new BrowserWindow({
     width: 1120,
     height: 820,
     minWidth: 780,
@@ -964,8 +749,7 @@ function createDoubaoWindow({ focus = true } = {}) {
       backgroundThrottling: false,
       safeDialogs: true
     }
-  }));
-  workerPoolState(doubaoWindow, 0);
+  });
 
   doubaoWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -991,16 +775,14 @@ function createDoubaoWindow({ focus = true } = {}) {
   doubaoWindow.webContents.on('did-finish-load', update);
   doubaoWindow.webContents.on('did-navigate', update);
   doubaoWindow.webContents.on('did-navigate-in-page', update);
-  doubaoWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
-  const createdDoubaoWindow = doubaoWindow;
-  createdDoubaoWindow.on('closed', () => {
-    if (doubaoWindow === createdDoubaoWindow) doubaoWindow = null;
-    if (activeBatchCount <= 0) loginFlowActive = false;
+  doubaoWindow.loadURL(DOUBAO_CHAT_URL);
+  doubaoWindow.on('closed', () => {
+    doubaoWindow = null;
+    loginFlowActive = false;
     clearInterval(loginTimer);
     loginTimer = null;
-    broadcastLoginStatus().catch(() => {});
+    broadcastLoginStatus();
   });
-  clearInterval(loginTimer);
   loginTimer = setInterval(broadcastLoginStatus, 5000);
   return doubaoWindow;
 }
@@ -1008,7 +790,7 @@ function createDoubaoWindow({ focus = true } = {}) {
 let auxWorkerWindows = [];
 
 function createAuxWorkerWindow(position) {
-  const workerWindow = bindDoubaoWorkerHealth(new BrowserWindow({
+  const workerWindow = new BrowserWindow({
     width: 1120,
     height: 820,
     minWidth: 780,
@@ -1024,8 +806,7 @@ function createAuxWorkerWindow(position) {
       backgroundThrottling: false,
       safeDialogs: true
     }
-  }));
-  workerPoolState(workerWindow, position + 1);
+  });
 
   workerWindow.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https:\/\/([\w-]+\.)*(doubao\.com|bytedance\.com|toutiao\.com|feishu\.cn)\//i.test(url)) {
@@ -1048,86 +829,47 @@ function createAuxWorkerWindow(position) {
   });
 
   workerWindow.on('closed', () => {
-    busyWindows.delete(workerWindow);
     auxWorkerWindows = auxWorkerWindows.filter((item) => item !== workerWindow);
   });
-  workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {});
+  workerWindow.loadURL(DOUBAO_CHAT_URL);
   return workerWindow;
 }
 
 function hideIdleDoubaoWindows() {
   const persistentSession = session.fromPartition(DOUBAO_PARTITION);
   for (const window of BrowserWindow.getAllWindows()) {
-    if (window !== mainWindow && windowUsesDoubaoSession(window, persistentSession) && !busyWindows.has(window)) {
-      try { window.hide(); } catch {}
+    if (window !== mainWindow && !window.isDestroyed() && window.webContents.session === persistentSession && !busyWindows.has(window)) {
+      window.hide();
     }
   }
 }
 
-async function ensureFixedWorkerPool(targetSize) {
-  const target = Math.min(MAX_CONCURRENT_LIMIT, Math.max(1, Math.round(Number(targetSize) || PARALLEL_WORKER_COUNT)));
-  fixedWorkerPoolTarget = target;
-
+// 为批次分配互不冲突的豆包窗口：优先复用空闲窗口，不够时新建；批次结束后释放
+async function acquireBatchWindows(count, { show }) {
   createDoubaoWindow({ focus: false });
-  workerPoolState(doubaoWindow, 0);
-
-  let healthy = allHealthyWorkerWindows();
-  while (healthy.length < target) {
-    const position = healthy.length;
-    const worker = createAuxWorkerWindow(Math.max(0, position - 1));
-    auxWorkerWindows.push(worker);
-    workerPoolState(worker, position);
-    healthy = allHealthyWorkerWindows();
-  }
-
-  // 并发设置从大调小时，只回收超出目标且当前空闲的尾部窗口；目标数量以内的窗口长期保活。
-  const ordered = allHealthyWorkerWindows();
-  for (let index = ordered.length - 1; index >= target; index -= 1) {
-    const window = ordered[index];
-    if (busyWindows.has(window)) continue;
-    if (window === doubaoWindow) continue;
-    discardDoubaoWorker(window);
-  }
-
-  return allHealthyWorkerWindows().slice(0, target);
-}
-
-// V2.0：全局固定窗口池。批次只能租用池内窗口；池满时等待空闲，不再额外创建第 N+1 个窗口。
-async function acquireBatchWindows(count, { show, poolSize, cancelRef } = {}) {
-  const pool = await ensureFixedWorkerPool(poolSize || count);
-  const needed = Math.min(Math.max(1, Number(count) || 1), pool.length);
-  let windows = [];
-
-  while (windows.length < needed) {
-    if (cancelRef?.value) throw loginRecoveryCancelledError();
-    let healthy = allHealthyWorkerWindows();
-    if (healthy.length < fixedWorkerPoolTarget) {
-      await ensureFixedWorkerPool(fixedWorkerPoolTarget);
-      healthy = allHealthyWorkerWindows();
+  const idleWindows = () => [doubaoWindow, ...auxWorkerWindows]
+    .filter((window) => window && !window.isDestroyed() && !busyWindows.has(window));
+  const windows = [];
+  for (let index = 0; index < count; index += 1) {
+    let window = idleWindows().find((item) => !windows.includes(item));
+    if (!window) {
+      window = createAuxWorkerWindow(auxWorkerWindows.length);
+      auxWorkerWindows.push(window);
     }
-    windows = healthy
-      .filter((window) => !busyWindows.has(window))
-      .slice(0, needed);
-
-    if (windows.length < needed) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      continue;
-    }
-  }
-
-  windows.forEach((window, index) => {
     busyWindows.add(window);
-    workerPoolState(window, allHealthyWorkerWindows().indexOf(window));
+    // 记录原始标题，任务期间的进度标题在批次结束后还原
     if (!window.__baseTitle) window.__baseTitle = window.getTitle();
-    if (show) {
+    windows.push(window);
+  }
+  if (show) {
+    windows.forEach((window, index) => {
       window.setPosition(90 + index * 56, 70 + index * 48);
       window.show();
-    }
-  });
-
-  if (show && activeBatchCount <= 1 && windows[0]) windows[0].focus();
-  if (!show) hideIdleDoubaoWindows();
-
+    });
+    if (activeBatchCount <= 1) windows[0].focus();
+  } else {
+    hideIdleDoubaoWindows();
+  }
   try {
     await Promise.all(windows.map(waitForDoubaoLoad));
   } catch (error) {
@@ -1135,26 +877,6 @@ async function acquireBatchWindows(count, { show, poolSize, cancelRef } = {}) {
     throw error;
   }
   return windows;
-}
-
-async function rebuildBatchWorker(slot, { show = false } = {}) {
-  const previous = slot?.window || null;
-  if (previous) discardDoubaoWorker(previous);
-
-  const replacement = createAuxWorkerWindow(Math.max(0, (Number(slot?.position) || 0) - 1));
-  auxWorkerWindows.push(replacement);
-  workerPoolState(replacement, Number(slot?.position) || 0);
-  resetWorkerConversationState(replacement, { forceRotate: true });
-  busyWindows.add(replacement);
-  if (!replacement.__baseTitle) replacement.__baseTitle = replacement.getTitle();
-  if (slot) slot.window = replacement;
-
-  if (show) {
-    replacement.setPosition(90 + (Number(slot?.position) || 0) * 56, 70 + (Number(slot?.position) || 0) * 48);
-    replacement.show();
-  }
-  await waitForDoubaoLoad(replacement);
-  return replacement;
 }
 
 async function validateImagePaths(paths) {
@@ -1231,28 +953,14 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     ? sanitizeSettings(rawSettings)
     : await saveSettings(rawSettings);
   const useParallel = mode !== 'manual' && settings.parallelProcessing && files.length > 1;
-  const configuredPoolSize = settings.parallelProcessing
-    ? (settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT)
-    : 1;
-  const windows = await acquireBatchWindows(
-    useParallel ? Math.min(configuredPoolSize, files.length) : 1,
-    {
-      show: settings.showBrowserWindow,
-      poolSize: configuredPoolSize,
-      cancelRef
-    }
-  );
-  const workerSlots = windows.map((window, index) => ({
-    window,
-    position: workerPoolState(window, index)?.position ?? index
-  }));
-  const browser = workerSlots[0]?.window || null;
-  const releaseWindows = () => workerSlots.forEach((slot) => {
-    const window = slot.window;
+  const windows = await acquireBatchWindows(useParallel ? Math.min(settings.maxConcurrentTasks || PARALLEL_WORKER_COUNT, files.length) : 1, {
+    show: settings.showBrowserWindow
+  });
+  const browser = windows[0];
+  const releaseWindows = () => windows.forEach((window) => {
     busyWindows.delete(window);
-    if (isDoubaoWorkerUsable(window) && window.__baseTitle) {
-      try { window.setTitle(window.__baseTitle); } catch {}
-    }
+    // 还原任务期间显示进度的窗口标题
+    if (!window.isDestroyed() && window.__baseTitle) window.setTitle(window.__baseTitle);
   });
 
   batchEvent({
@@ -1262,8 +970,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     mode,
     path: runtime.eventPath || null,
     parallel: useParallel,
-    workers: useParallel ? windows.length : 1,
-    workerPoolSize: fixedWorkerPoolTarget
+    workers: useParallel ? windows.length : 1
   });
   const results = [];
 
@@ -1293,8 +1000,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       // 进度同时打到豆包窗口标题：开着调试窗口时能直接看到当前进行到哪一步，不再像卡住
       onProgress: (message) => {
         batchEvent({ type: 'job-progress', ...jobBase, message });
-        if (isDoubaoWorkerUsable(workerWindow)) {
-          try { workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`); } catch {}
+        if (workerWindow && !workerWindow.isDestroyed()) {
+          workerWindow.setTitle(`${rendererI18n.t(message)} · ${mt('水印清理工作台', 'Watermark Lab')}`);
         }
       },
       // 返回 false = 已有其他窗口在验证（本任务是跟随者）：不弹窗，静默等待领头完成后自动重跑。
@@ -1302,16 +1009,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       onVerificationRequired: () => {
         if (verificationGate.owner && verificationGate.owner !== verificationToken) return false;
         verificationGate.owner = verificationToken;
-        const risk = registerVerificationRisk();
-        batchEvent({
-          type: 'job-progress',
-          ...jobBase,
-          message: `检测到安全验证，已进入低验证调度模式（风险等级 ${risk.level}/3）`
-        });
-        const focusTarget = isDoubaoWorkerUsable(workerWindow)
-          ? workerWindow
-          : (isDoubaoWorkerUsable(browser) ? browser : null);
-        if (focusTarget) {
+        const focusTarget = (workerWindow && !workerWindow.isDestroyed() && workerWindow) || browser;
+        if (focusTarget && !focusTarget.isDestroyed()) {
           if (focusTarget.isMinimized()) focusTarget.restore();
           focusTarget.show();
           focusTarget.moveTop();
@@ -1326,92 +1025,34 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         if (verificationGate.owner !== verificationToken) return;
         verificationGate.owner = null;
         verificationEpoch.value += 1;
-        clearVerificationRisk();
         batchEvent({ type: 'verification-cleared', ...jobBase });
         if (!settings.showBrowserWindow) {
-          if (isDoubaoWorkerUsable(workerWindow)) workerWindow.hide();
+          if (workerWindow && !workerWindow.isDestroyed()) workerWindow.hide();
           hideIdleDoubaoWindows();
         }
       }
     });
 
-    // V2.0 普通批量任务不再按“图片历史会话”跳来跳去，而是固定复用所属 worker 当前聊天。
-    // 手动局部重绘仍可接回该图片历史会话，避免破坏已有编辑链。
-    let taskConversationId = mode === 'manual' && typeof file.conversationId === 'string'
-      ? file.conversationId
-      : '';
+    let taskConversationId = typeof file.conversationId === 'string' ? file.conversationId : '';
+    // 同一会话不能被两个任务同时使用（无论并行任务还是并发批次），后来的任务另起新会话
     if (taskConversationId && inUseConversations.has(taskConversationId)) taskConversationId = '';
     if (taskConversationId) inUseConversations.add(taskConversationId);
-
-    const conversationPlan = mode === 'manual'
-      ? { rotate: true, reason: 'manual', state: workerPoolState(workerWindow) }
-      : planWorkerConversation(workerWindow);
-    const poolState = conversationPlan.state || workerPoolState(workerWindow);
-    if (mode !== 'manual') {
-      const workerNumber = (Number(poolState?.position) || 0) + 1;
-      const reasonText = conversationPlan.reason === 'image-limit'
-        ? `已处理 ${CONVERSATION_IMAGE_LIMIT} 张`
-        : conversationPlan.reason === 'time-limit'
-          ? '当前聊天已使用约 15 分钟'
-          : conversationPlan.reason === 'forced'
-            ? '上次会话需要重置'
-            : '工作窗口首次使用';
-      batchEvent({
-        type: 'job-progress',
-        ...jobBase,
-        message: conversationPlan.rotate
-          ? `工作窗口 ${workerNumber}：${reasonText}，正在切换新聊天`
-          : `工作窗口 ${workerNumber}：继续复用当前聊天（${poolState.conversationImageCount + 1}/${CONVERSATION_IMAGE_LIMIT}）`
-      });
-    }
     let paddedUpload = null;
-    const taskStartedAt = Date.now();
-    const timings = {
-      firstPassMs: 0,
-      fallbackPassMs: 0,
-      downloadSaveMs: 0,
-      auditDispatchDelayMs: 0,
-      auditMs: 0,
-      repairMs: 0,
-      qcMs: 0,
-      totalMs: 0
-    };
-    let qcPromise = null;
-    let qcTargetPath = '';
-    const launchQc = (targetPath) => {
-      const started = Date.now();
-      qcTargetPath = targetPath;
-      // 延后一拍启动，让网络型残留复检先进入 await；QC 的本地 CPU 工作随后利用等待时间完成，
-      // 避免在开始复检前先同步卡住主进程。
-      return new Promise((resolve) => {
-        setImmediate(() => {
-          runQcCheck(sourcePath, targetPath)
-            .then((qc) => resolve({ qc, error: null, elapsedMs: Date.now() - started }))
-            .catch((error) => resolve({ qc: null, error, elapsedMs: Date.now() - started }));
-        });
-      });
-    };
     try {
       const promptText = runtime.prompt || buildPrompt(settings);
       // 第一轮：原图直发（不加隔离带、不做任何加工），尝试从接口拦截无水印原图；
       // 命中即不裁切直接导出
-      const firstPassStarted = Date.now();
       const firstPass = await automation.processImage({
         filePath: file.path,
         prompt: promptText,
-        // V2.0：普通批量任务每个 worker 最多连续处理 3 张或 15 分钟才换聊天；
-        // 单张图片内部的生成/复检/补修始终留在同一个聊天闭环。
-        newConversation: mode === 'manual' ? true : conversationPlan.rotate,
-        conversationId: mode === 'manual' ? taskConversationId : '',
+        // 每个任务独占一个会话：有历史会话先接回（接回失败 processImage 内会自动开新对话），
+        // 没有历史会话的一律开新对话，避免多张图串进同一会话、记录的会话 ID 互相覆盖
+        newConversation: true,
+        conversationId: taskConversationId,
         imageWaitSeconds: settings.imageWaitSeconds
       });
-      timings.firstPassMs += Date.now() - firstPassStarted;
-      if (mode !== 'manual' && conversationPlan.rotate) {
-        markWorkerConversationStarted(workerWindow);
-      }
       let candidates = firstPass.candidates;
       let conversationId = firstPass.conversationId;
-      let finalGenerationReadyAt = Number(firstPass.generationReadyAt) || Date.now();
       let uploadPath = file.path;
       // 降级：接口没拦截到无水印原图时，加临时隔离带在同会话重发一次，回到白边裁切管线。
       // （第一轮无隔离带，生成图的 AI 标识落在画面内无法干净裁除，所以必须带隔离带重发；
@@ -1431,59 +1072,21 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           edge: settings.cropEdge
         });
         uploadPath = paddedUpload.path;
-        const fallbackPassStarted = Date.now();
         const secondPass = await automation.processImage({
           filePath: uploadPath,
           prompt: promptText,
-          newConversation: mode === 'manual',
-          conversationId: mode === 'manual' ? (conversationId || taskConversationId) : '',
+          newConversation: true,
+          conversationId: conversationId || taskConversationId,
           imageWaitSeconds: settings.imageWaitSeconds
         });
-        timings.fallbackPassMs += Date.now() - fallbackPassStarted;
         candidates = secondPass.candidates;
         conversationId = secondPass.conversationId || conversationId;
-        finalGenerationReadyAt = Number(secondPass.generationReadyAt) || Date.now();
       }
-
-      // V1.9：最终一轮生成一结束就立刻发同会话复检，不再等下载、校验、保存、QC。
-      // 下载/保存和复检并行；只有同会话复检失败时，才在保存完成后用文件重新上传兜底。
-      let immediateAuditPromise = null;
-      if (mode !== 'manual') {
-        batchEvent({
-          type: 'job-progress',
-          ...jobBase,
-          message: '生成结果已就绪，正在立即发送残留复检指令'
-        });
-        const immediateAuditStarted = Date.now();
-        immediateAuditPromise = automation.inspectLatestGeneratedResidual({
-          prompt: buildSameConversationWatermarkAuditPrompt(settings),
-          timeoutMs: 45_000,
-          skipAuthCheck: true,
-          onDispatched: (dispatchedAt) => {
-            timings.auditDispatchDelayMs = Math.max(0, Number(dispatchedAt) - finalGenerationReadyAt);
-            batchEvent({
-              type: 'job-progress',
-              ...jobBase,
-              message: `残留复检指令已发出（生成后 ${(timings.auditDispatchDelayMs / 1000).toFixed(1)} 秒）`
-            });
-          }
-        }).then((audit) => ({
-          audit,
-          error: null,
-          elapsedMs: Date.now() - immediateAuditStarted
-        })).catch((error) => ({
-          audit: null,
-          error,
-          elapsedMs: Date.now() - immediateAuditStarted
-        }));
-      }
-
-      const downloadSaveStarted = Date.now();
       let candidate;
       try {
         candidate = await downloadBestImage({
           candidates,
-          electronSession: doubaoWorkerSession(workerWindow),
+          electronSession: workerWindow.webContents.session,
           nativeImage,
           preferOriginal: settings.preferOriginal,
           onProgress: (message) => {
@@ -1499,8 +1102,6 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ...jobBase,
           message: '大图链接不可直接下载，切换到高清画布导出'
         });
-        // 高清画布导出依赖页面 DOM；若同会话复检正在回复，先让它结束，避免互相抢页面状态。
-        if (immediateAuditPromise) await immediateAuditPromise.catch(() => {});
         try {
           candidate = await automation.captureLatestGeneratedCanvas(nativeImage, candidates);
         } catch (canvasError) {
@@ -1517,7 +1118,6 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           ...jobBase,
           message: '候选资源与上传图片完全相同，已作废并切换到生成结果画布'
         });
-        if (immediateAuditPromise) await immediateAuditPromise.catch(() => {});
         try {
           candidate = await automation.captureLatestGeneratedCanvas(nativeImage, candidates);
         } catch (canvasError) {
@@ -1531,10 +1131,6 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         settings,
         paddedUpload
       });
-      timings.downloadSaveMs += Date.now() - downloadSaveStarted;
-
-      // 本地像素 QC 与豆包残留复检并行。正常结果只做快速像素比较，不再生成热力图。
-      qcPromise = launchQc(saved.path);
 
       // 通用残留水印闭环：不依赖固定位置、颜色、语言或某一种 Logo。
       // 先让视觉模型全图复检并返回归一化区域；只对高置信区域自动打粉色遮罩做定点补修，
@@ -1542,8 +1138,6 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       let autoRepairPasses = 0;
       let residualAuditCount = 0;
       let residualStatus = mode === 'manual' ? 'manual-skip' : 'checking';
-      let sameConversationAuditCount = 0;
-      let auditFallbackCount = 0;
       if (mode !== 'manual') {
         const maxAutoRepairPasses = 2;
         for (let auditIndex = 0; auditIndex <= maxAutoRepairPasses; auditIndex += 1) {
@@ -1555,47 +1149,13 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               ...jobBase,
               message: `正在全图复检残留水印（${residualAuditCount}/${maxAutoRepairPasses + 1}）`
             });
-            const auditStarted = Date.now();
-            try {
-              if (auditIndex === 0 && immediateAuditPromise) {
-                const prefetched = await immediateAuditPromise;
-                timings.auditMs += Number(prefetched.elapsedMs) || 0;
-                if (prefetched.error) throw prefetched.error;
-                audit = prefetched.audit;
-              } else {
-                audit = await automation.inspectLatestGeneratedResidual({
-                  prompt: buildSameConversationWatermarkAuditPrompt(settings),
-                  timeoutMs: 45_000,
-                  skipAuthCheck: true
-                });
-                timings.auditMs += Date.now() - auditStarted;
-              }
-              sameConversationAuditCount += 1;
-              batchEvent({
-                type: 'job-progress',
-                ...jobBase,
-                message: '同会话复检完成：未重新上传处理结果'
-              });
-            } catch (sameAuditError) {
-              if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(sameAuditError.code) || isDestroyedObjectError(sameAuditError)) {
-                throw sameAuditError;
-              }
-              auditFallbackCount += 1;
-              batchEvent({
-                type: 'job-progress',
-                ...jobBase,
-                message: `同会话复检未完成：${sameAuditError.message || sameAuditError}；正在回退到重新上传复检`
-              });
-              const fallbackAuditStarted = Date.now();
-              audit = await automation.inspectWatermarkResidual({
-                filePath: saved.path,
-                prompt: buildWatermarkAuditPrompt(settings),
-                timeoutMs: 90_000
-              });
-              timings.auditMs += Date.now() - fallbackAuditStarted;
-            }
+            audit = await automation.inspectWatermarkResidual({
+              filePath: saved.path,
+              prompt: buildWatermarkAuditPrompt(settings),
+              timeoutMs: 90_000
+            });
           } catch (auditError) {
-            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(auditError.code) || isDestroyedObjectError(auditError)) {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(auditError.code)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw auditError;
             }
@@ -1613,20 +1173,15 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             break;
           }
 
-          // 第一轮允许 0.62 以上的高置信残留自动补修；第一轮补修后，
-          // 第二轮只处理 >=0.82 的明确残留，避免为了低置信疑点再跑一整轮豆包生成。
-          const minRepairConfidence = autoRepairPasses > 0 ? 0.82 : 0.62;
           const repairRegions = (Array.isArray(audit.regions) ? audit.regions : [])
-            .filter((region) => Number(region.confidence) >= minRepairConfidence)
+            .filter((region) => Number(region.confidence) >= 0.62)
             .slice(0, 48);
           if (!repairRegions.length) {
             residualStatus = 'review';
             batchEvent({
               type: 'job-progress',
               ...jobBase,
-              message: autoRepairPasses > 0
-                ? '第一轮补修后仅剩低置信度疑似残留，已停止继续生成并保留结果供人工确认'
-                : '检测到低置信度疑似标记，为避免误删真实场景文字，已保留当前结果供人工确认'
+              message: '检测到低置信度疑似标记，为避免误删真实场景文字，已保留当前结果供人工确认'
             });
             break;
           }
@@ -1648,7 +1203,6 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
 
           let markedUpload = null;
           let repairPadding = null;
-          const repairStarted = Date.now();
           try {
             batchEvent({
               type: 'job-progress',
@@ -1664,11 +1218,10 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             });
 
             const repairPrompt = buildManualEditPrompt(settings);
-            // 补修也优先留在当前图片自己的会话里，避免每轮再创建新对话。
             const repairFirstPass = await automation.processImage({
               filePath: markedUpload.path,
               prompt: repairPrompt,
-              newConversation: false,
+              newConversation: true,
               conversationId: '',
               imageWaitSeconds: settings.imageWaitSeconds
             });
@@ -1689,8 +1242,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
               const repairSecondPass = await automation.processImage({
                 filePath: repairUploadPath,
                 prompt: repairPrompt,
-                newConversation: false,
-                conversationId: '',
+                newConversation: true,
+                conversationId: repairFirstPass.conversationId || '',
                 imageWaitSeconds: settings.imageWaitSeconds
               });
               repairCandidates = repairSecondPass.candidates;
@@ -1700,7 +1253,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             try {
               repairCandidate = await downloadBestImage({
                 candidates: repairCandidates,
-                electronSession: doubaoWorkerSession(workerWindow),
+                electronSession: workerWindow.webContents.session,
                 nativeImage,
                 preferOriginal: settings.preferOriginal,
                 onProgress: (message) => batchEvent({ type: 'job-progress', ...jobBase, message })
@@ -1742,11 +1295,8 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             saved = repaired;
             autoRepairPasses += 1;
             residualStatus = 'repaired-pending-audit';
-            // 初始结果的并行 QC 已经过期，最终只需要对最新补修结果再做一次。
-            qcPromise = null;
-            qcTargetPath = '';
           } catch (repairError) {
-            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED', 'WORKER_DESTROYED'].includes(repairError.code) || isDestroyedObjectError(repairError)) {
+            if (['CANCELLED', 'VERIFICATION_INTERRUPTED', 'LOGIN_RECOVERED_RESTART', 'LOGIN_RECOVERY_REQUIRED'].includes(repairError.code)) {
               await fs.rm(saved.path, { force: true }).catch(() => {});
               throw repairError;
             }
@@ -1758,7 +1308,6 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             });
             break;
           } finally {
-            timings.repairMs += Date.now() - repairStarted;
             if (markedUpload?.directory) {
               await fs.rm(markedUpload.directory, { recursive: true, force: true }).catch(() => {});
             }
@@ -1769,23 +1318,16 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         }
       }
 
-      // QC 已和第一次残留复检并行启动。只有开启“覆盖原图”时才同步等待，
-      // 因为此时 QC 是允许覆盖的安全门；普通保存模式则先完成任务，QC 在后台补回结果。
-      if (!qcPromise || qcTargetPath !== saved.path) qcPromise = launchQc(saved.path);
+      // 最终像素质检必须在覆盖原图之前完成；只有“残留复检通过 + 像素质检正常”才允许替换。
       let finalQc = null;
-      let finalQcError = null;
-      if (settings.overwriteOriginal) {
-        const qcOutcome = await qcPromise;
-        timings.qcMs = qcOutcome.elapsedMs || 0;
-        finalQc = qcOutcome.qc;
-        finalQcError = qcOutcome.error;
-        if (finalQcError) {
-          batchEvent({
-            type: 'job-progress',
-            ...jobBase,
-            message: `最终质检未完成：${finalQcError.message || finalQcError}；不会覆盖原图`
-          });
-        }
+      try {
+        finalQc = await runQcCheck(sourcePath, saved.path);
+      } catch (qcError) {
+        batchEvent({
+          type: 'job-progress',
+          ...jobBase,
+          message: `最终质检未完成：${qcError.message || qcError}；不会覆盖原图`
+        });
       }
 
       let overwriteStatus = settings.overwriteOriginal ? 'blocked-qc' : 'disabled';
@@ -1844,44 +1386,12 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         batchEvent({ type: 'job-progress', ...jobBase, message: reasonMessage });
       }
 
-      timings.totalMs = Date.now() - taskStartedAt;
-      const seconds = (ms) => (Math.max(0, Number(ms) || 0) / 1000).toFixed(1);
-      const timingSummary = [
-        `首次处理 ${seconds(timings.firstPassMs)}秒`,
-        timings.fallbackPassMs > 0 ? `降级重发 ${seconds(timings.fallbackPassMs)}秒` : '',
-        `复检发起 ${seconds(timings.auditDispatchDelayMs)}秒`,
-        `复检 ${seconds(timings.auditMs)}秒`,
-        timings.repairMs > 0 ? `补修 ${seconds(timings.repairMs)}秒` : '',
-        settings.overwriteOriginal ? `质检 ${seconds(timings.qcMs)}秒` : '质检 后台',
-        mode === 'manual'
-          ? '复检模式 手动跳过'
-          : `复检模式 同会话${auditFallbackCount > 0 ? `/回退${auditFallbackCount}次` : ''}`,
-        `总计 ${seconds(timings.totalMs)}秒`
-      ].filter(Boolean).join(' / ');
-      batchEvent({ type: 'job-progress', ...jobBase, message: `本图耗时：${timingSummary}` });
-
-      if (mode === 'manual') {
-        resetWorkerConversationState(workerWindow, { forceRotate: true });
-      } else if (auditFallbackCount > 0) {
-        // 重新上传兜底会新建专用复检聊天，下一张图重新开一个干净聊天再进入固定复用周期。
-        resetWorkerConversationState(workerWindow, { forceRotate: true });
-      } else {
-        markWorkerImageCompleted(workerWindow);
-      }
-
       const result = {
         ...jobBase,
         ...saved,
         autoRepairPasses,
         residualAuditCount,
         residualStatus,
-        sameConversationAuditCount,
-        auditFallbackCount,
-        auditMode: mode === 'manual'
-          ? 'manual-skip'
-          : (auditFallbackCount > 0 ? 'same-conversation-with-fallback' : 'same-conversation'),
-        timings,
-        timingSummary,
         overwroteOriginal,
         overwriteStatus,
         ...(refreshedSource ? { refreshedSource } : {}),
@@ -1892,32 +1402,13 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
       };
       results.push(result);
       batchEvent({ type: 'job-complete', ...result });
-      if (settings.overwriteOriginal) {
-        if (finalQc) {
-          batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc, qcElapsedMs: timings.qcMs });
-        }
-      } else {
-        // 不开启覆盖原图时，不再让本地 QC 阻塞“完成”。QC 结束后只补发质检事件。
-        const backgroundOutputPath = saved.path;
-        qcPromise.then((qcOutcome) => {
-          if (!qcOutcome?.qc) return;
-          batchEvent({
-            type: 'job-qc',
-            ...jobBase,
-            outputPath: backgroundOutputPath,
-            qc: qcOutcome.qc,
-            qcElapsedMs: qcOutcome.elapsedMs || 0
-          });
-        }).catch(() => {});
+      if (finalQc) {
+        batchEvent({ type: 'job-qc', ...jobBase, outputPath: saved.path, qc: finalQc });
       }
     } catch (error) {
-      // 任何未完成任务都可能把当前聊天留在半成品状态；下一张任务强制换一个干净聊天。
-      const state = workerPoolState(workerWindow);
-      if (state) state.forceConversationRotate = true;
-      error = normalizeTaskError(error);
       if (error.code === 'CANCELLED' || cancelRef.value) return;
-      if (error.code === 'VERIFICATION_INTERRUPTED') return { kind: 'retry-verification', error };
-      if (error.code === 'LOGIN_RECOVERED_RESTART') return { kind: 'retry-login', error };
+      if (error.code === 'VERIFICATION_INTERRUPTED') return 'retry-verification';
+      if (error.code === 'LOGIN_RECOVERED_RESTART') return 'retry-login';
       if (error.code === 'LOGIN_RECOVERY_REQUIRED') {
         try {
           await recoverDoubaoLogin(workerWindow, {
@@ -1925,18 +1416,11 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
             jobBase,
             keepVisible: settings.showBrowserWindow
           });
-          return { kind: 'retry-login', error };
+          return 'retry-login';
         } catch (recoveryError) {
           if (recoveryError.code === 'CANCELLED' || cancelRef.value) return;
-          error = normalizeTaskError(recoveryError);
+          error = recoveryError;
         }
-      }
-      if (shouldAutoRetryTaskError(error)) {
-        return {
-          kind: 'retry-error',
-          error,
-          conversationId: error.conversationId || taskConversationId || ''
-        };
       }
       const result = {
         ...jobBase,
@@ -1955,63 +1439,35 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
     }
   };
 
-  // 安全验证、登录恢复与普通失败分别管理重启次数。
-  // 普通可恢复失败最多自动重跑 3 次；每次都重建当前 worker，彻底丢弃可能污染/失效的页面上下文。
-  const processAt = async (index, slot) => {
+  // 安全验证与登录恢复都采用“恢复完成后整任务重跑”，避免继续使用可能已失效的上传/生成上下文。
+  // 两类恢复分别计数：安全验证最多 2 次，登录恢复最多 3 次，互不占用彼此次数。
+  const processAt = async (index, workerWindow) => {
     const maxVerificationRestarts = 2;
     const maxLoginRestarts = 3;
     let verificationRestarts = 0;
     let loginRestarts = 0;
-    let autoRetries = 0;
     const epochRef = {
       verification: verificationEpoch.value,
       login: loginRecoveryEpoch.value
     };
 
-    const file = files[index];
-    const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
-    const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
-    const common = {
-      index,
-      batchId,
-      path: eventPath,
-      name: path.basename(sourcePath),
-      total: files.length,
-      mode
-    };
-
     while (!cancelRef.value) {
-      let workerWindow = slot.window;
-      let outcome;
-
-      if (!isDoubaoWorkerUsable(workerWindow)) {
-        outcome = { kind: 'retry-error', error: workerDestroyedError() };
-      } else {
-        try {
-          outcome = await processAttempt(index, workerWindow, epochRef);
-        } catch (error) {
-          const normalized = normalizeTaskError(error);
-          if (normalized.code === 'CANCELLED' || cancelRef.value) return;
-          outcome = shouldAutoRetryTaskError(normalized)
-            ? { kind: 'retry-error', error: normalized }
-            : { kind: 'fatal-error', error: normalized };
-        }
-      }
-
+      const outcome = await processAttempt(index, workerWindow, epochRef);
       if (!outcome || cancelRef.value) return;
 
-      if (outcome.kind === 'fatal-error') {
-        const result = {
-          ...common,
-          error: outcome.error?.message || String(outcome.error || '任务失败'),
-          conversationId: typeof files[index].conversationId === 'string' ? files[index].conversationId : ''
-        };
-        results.push(result);
-        batchEvent({ type: 'job-error', ...result });
-        return;
-      }
+      const file = files[index];
+      const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
+      const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
+      const common = {
+        index,
+        batchId,
+        path: eventPath,
+        name: path.basename(sourcePath),
+        total: files.length,
+        mode
+      };
 
-      if (outcome.kind === 'retry-login') {
+      if (outcome === 'retry-login') {
         loginRestarts += 1;
         if (loginRestarts > maxLoginRestarts) {
           const result = {
@@ -2023,14 +1479,9 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           batchEvent({ type: 'job-error', ...result });
           return;
         }
-        workerWindow = slot.window;
-        if (!isDoubaoWorkerUsable(workerWindow)) {
-          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow }).catch(() => {});
-          workerWindow = slot.window;
-        } else {
+        if (workerWindow && !workerWindow.isDestroyed()) {
           await loadDoubaoChatForRecovery(workerWindow).catch(() => {});
         }
-        resetWorkerConversationState(slot.window, { forceRotate: true });
         epochRef.login = loginRecoveryEpoch.value;
         epochRef.verification = verificationEpoch.value;
         batchEvent({
@@ -2041,7 +1492,7 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
         continue;
       }
 
-      if (outcome.kind === 'retry-verification') {
+      if (outcome === 'retry-verification') {
         verificationRestarts += 1;
         if (verificationRestarts > maxVerificationRestarts) {
           const result = {
@@ -2053,78 +1504,20 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
           batchEvent({ type: 'job-error', ...result });
           return;
         }
-
-        workerWindow = slot.window;
-        if (!isDoubaoWorkerUsable(workerWindow)) {
-          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow }).catch(() => {});
-        } else {
+        // 验证是会话级风控；重跑前统一刷新聊天页，清掉当前窗口残留的挑战浮层。
+        if (workerWindow && !workerWindow.isDestroyed()) {
           await Promise.race([
             workerWindow.loadURL(DOUBAO_CHAT_URL).catch(() => {}),
             new Promise((resolve) => setTimeout(resolve, 15_000))
           ]);
         }
-
-        resetWorkerConversationState(slot.window, { forceRotate: true });
         epochRef.verification = verificationEpoch.value;
         epochRef.login = loginRecoveryEpoch.value;
-        const retrySpacing = dispatchSpacingMs(verificationRisk, Date.now());
-        const retryCooldown = Math.max(0, (Number(verificationRisk.cooldownUntil) || 0) - Date.now());
-        const staggerMs = retryCooldown + Math.max(0, Number(slot.position) || 0) * retrySpacing;
         batchEvent({
           type: 'job-progress',
           ...common,
-          message: `安全验证已中断任务，低验证模式错峰 ${Math.ceil(staggerMs / 1000)} 秒后重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
+          message: `安全验证已中断任务，正在重新开始（第 ${verificationRestarts}/${maxVerificationRestarts} 次）`
         });
-        if (staggerMs > 0) {
-          await new Promise((resolve) => setTimeout(resolve, staggerMs));
-        }
-        continue;
-      }
-
-      if (outcome.kind === 'retry-error') {
-        const retryError = normalizeTaskError(outcome.error);
-        if (!shouldAutoRetryTaskError(retryError)) {
-          const result = {
-            ...common,
-            error: retryError.message || String(retryError),
-            conversationId: outcome.conversationId || (typeof files[index].conversationId === 'string' ? files[index].conversationId : '')
-          };
-          results.push(result);
-          batchEvent({ type: 'job-error', ...result });
-          return;
-        }
-
-        autoRetries += 1;
-        if (autoRetries > MAX_AUTO_RETRIES) {
-          const result = {
-            ...common,
-            error: exhaustedRetryMessage(retryError, MAX_AUTO_RETRIES),
-            conversationId: outcome.conversationId || (typeof files[index].conversationId === 'string' ? files[index].conversationId : '')
-          };
-          results.push(result);
-          batchEvent({ type: 'job-error', ...result });
-          return;
-        }
-
-        batchEvent({
-          type: 'job-progress',
-          ...common,
-          message: retryProgressMessage(retryError, autoRetries, MAX_AUTO_RETRIES)
-        });
-
-        // 所有普通失败都换一个全新的 worker 再跑，避免旧 DOM、旧 debugger、旧渲染进程状态污染下一次尝试。
-        try {
-          await rebuildBatchWorker(slot, { show: settings.showBrowserWindow });
-        } catch (rebuildError) {
-          const normalizedRebuild = normalizeTaskError(rebuildError);
-          batchEvent({
-            type: 'job-progress',
-            ...common,
-            message: `重新创建豆包工作窗口未完成：${normalizedRebuild.message || normalizedRebuild}`
-          });
-        }
-        epochRef.login = loginRecoveryEpoch.value;
-        epochRef.verification = verificationEpoch.value;
         continue;
       }
 
@@ -2133,53 +1526,29 @@ async function runBatchReserved(items, rawSettings, runtime, { mode, batchId, ca
   };
 
   try {
-    const runWithDispatchPermit = async (index, slot) => {
-      const file = files[index];
-      const eventPath = files.length === 1 && runtime.eventPath ? runtime.eventPath : file.path;
-      const sourcePath = files.length === 1 && runtime.sourcePath ? runtime.sourcePath : file.path;
-      const dispatchBase = {
-        index,
-        batchId,
-        path: eventPath,
-        name: path.basename(sourcePath),
-        total: files.length,
-        mode
-      };
-      const releasePermit = await waitForWorkerDispatchPermit({
-        slot,
-        cancelRef,
-        jobBase: dispatchBase,
-        maxConcurrent: configuredPoolSize
-      });
-      try {
-        await processAt(index, slot);
-      } finally {
-        releasePermit();
-      }
-    };
-
     if (!useParallel) {
       for (let index = 0; index < files.length; index += 1) {
         if (cancelRef.value) break;
-        await runWithDispatchPermit(index, workerSlots[0]);
+        await processAt(index, browser);
         if (index < files.length - 1 && !cancelRef.value && settings.intervalSeconds > 0) {
           batchEvent({ type: 'batch-wait', seconds: settings.intervalSeconds, nextIndex: index + 1 });
           await new Promise((resolve) => setTimeout(resolve, settings.intervalSeconds * 1000));
         }
       }
     } else {
-      // 固定工作池：每个 slot 连续接单，但新任务启动经过全局错峰门。
-      // 正常状态约 700ms 错峰；验证频繁时自动拉大到 1.5~5 秒并限制新任务并发。
+      // 多线程：每个工作窗口独立取任务，全部同时启动，不做人为错峰。
+      // 每个任务本身要经历开对话/上传/发送多个步骤，各窗口的请求节奏天然错开；
+      // 偶发的安全验证由批次级验证兜底机制处理（暂停 → 手动完成 → 整批自动重启）
       let nextIndex = 0;
-      const worker = async (slot) => {
+      const worker = async (workerWindow) => {
         while (!cancelRef.value) {
           const index = nextIndex;
           nextIndex += 1;
           if (index >= files.length) return;
-          await runWithDispatchPermit(index, slot);
+          await processAt(index, workerWindow);
         }
       };
-      await Promise.all(workerSlots.map((slot) => worker(slot)));
+      await Promise.all(windows.map((workerWindow) => worker(workerWindow)));
     }
   } finally {
     releaseWindows();
@@ -2273,7 +1642,7 @@ async function runManualEdit(payload = {}) {
 // 自动质检：对比原图与处理结果，识别"疑似未处理 / 差异过大"并生成差异热力图。
 // 无额外图像依赖：用 nativeImage 解码，统一缩到相同尺寸（≤512）后逐像素比较；
 // 热力图按输出路径命名（同名覆盖，不会越积越多），存于 userData/qc。
-async function runQcCheck(sourcePath, outputPath, { forceHeatmap = false } = {}) {
+async function runQcCheck(sourcePath, outputPath) {
   const sourceImage = nativeImage.createFromPath(sourcePath);
   const outputImage = nativeImage.createFromPath(outputPath);
   if (sourceImage.isEmpty() || outputImage.isEmpty()) throw new Error('质检图片读取失败');
@@ -2287,10 +1656,6 @@ async function runQcCheck(sourcePath, outputPath, { forceHeatmap = false } = {})
   const outputPixels = outputImage.resize({ width, height, quality: 'good' }).toBitmap();
   const stats = computeDiffStats(sourcePixels, outputPixels);
   const verdict = verdictForStats(stats);
-
-  // 正常图片不再生成/写入热力图；只有异常结果或明确要求时才做额外 I/O。
-  if (verdict === 'ok' && !forceHeatmap) return { verdict, ...stats, heatmapPath: '' };
-
   const heatmapPixels = buildHeatmap(sourcePixels, outputPixels, width, height, 2);
   const heatmap = nativeImage.createFromBitmap(heatmapPixels, { width, height });
   const directory = path.join(app.getPath('userData'), 'qc');

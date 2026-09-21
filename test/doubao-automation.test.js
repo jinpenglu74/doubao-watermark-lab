@@ -2,8 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { DoubaoAutomation, classifyLoginState, conversationIdFromUrl, imageAssetKey, noImageGeneratedError, parseWatermarkAudit, responseHeader, settledNoImageGraceMs } = require('../src/doubao-automation');
-const { buildSameConversationWatermarkAuditPrompt } = require('../src/prompt');
+const { classifyLoginState, conversationIdFromUrl, imageAssetKey, noImageGeneratedError, parseWatermarkAudit, responseHeader } = require('../src/doubao-automation');
 
 test('解析新版 Electron 的响应头对象', () => {
   assert.equal(responseHeader({
@@ -144,56 +143,4 @@ test('只有 Cookie、页面信号缺失时保持 uncertain，交给恢复流程
   assert.equal(status.state, 'uncertain');
   assert.equal(status.loggedIn, false);
   assert.equal(status.cookieHint, true);
-});
-
-
-test('已销毁 BrowserWindow 不再冒出 Electron 原始 Object has been destroyed，而是标准 WORKER_DESTROYED', () => {
-  assert.throws(
-    () => new DoubaoAutomation({ isDestroyed: () => true }),
-    (error) => {
-      assert.equal(error.code, 'WORKER_DESTROYED');
-      assert.match(error.message, /豆包工作窗口已失效/);
-      return true;
-    }
-  );
-});
-
-
-test('明确回复已结束后，无图等待最多 20 秒；生成状态不明确时保留用户设置', () => {
-  assert.equal(settledNoImageGraceMs(60_000, true), 20_000);
-  assert.equal(settledNoImageGraceMs(15_000, true), 15_000);
-  assert.equal(settledNoImageGraceMs(60_000, false), 60_000);
-});
-
-test('健康登录状态在 15 秒内复用，强制检查仍会重新确认', async () => {
-  const automation = new DoubaoAutomation({
-    isDestroyed: () => false,
-    webContents: {
-      isDestroyed: () => false,
-      session: {}
-    }
-  });
-  let checks = 0;
-  automation.confirmLoginStatus = async () => {
-    checks += 1;
-    return { state: 'authenticated', loggedIn: true };
-  };
-  await automation.requireAuthenticated();
-  await automation.requireAuthenticated();
-  assert.equal(checks, 1);
-  await automation.requireAuthenticated({ force: true });
-  assert.equal(checks, 2);
-});
-
-
-test('同会话残留复检提示词明确锁定刚生成的最后一张结果图', () => {
-  const prompt = buildSameConversationWatermarkAuditPrompt({ language: 'zh' });
-  assert.match(prompt, /刚刚生成的最后一张处理结果图/);
-  assert.match(prompt, /不要检查用户最初上传的原图/);
-  assert.match(prompt, /不要生成新图片/);
-  assert.match(prompt, /hasResidual/);
-});
-
-test('DoubaoAutomation 提供同会话复检能力', () => {
-  assert.equal(typeof DoubaoAutomation.prototype.inspectLatestGeneratedResidual, 'function');
 });

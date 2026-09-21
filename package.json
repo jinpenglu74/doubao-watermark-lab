@@ -1,6 +1,6 @@
 {
   "name": "doubao-watermark-lab",
-  "version": "2.0.0",
+  "version": "1.5.0",
   "description": "基于 Electron 和豆包网页版的批量图片去水印工作台",
   "main": "src/main.js",
   "author": "Watermark Lab",
@@ -8,8 +8,8 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron . --dev",
-    "check": "node --check src/main.js && node --check src/preload.js && node --check src/preview-preload.js && node --check src/manual-preload.js && node --check src/advanced-preload.js && node --check src/doubao-automation.js && node --check src/update-check.js && node --check src/qc-check.js && node --check src/theme-icon.js && node --check src/image-pipeline.js && node --check src/original-overwrite.js && node --check src/task-retry.js && node --check src/worker-pool-policy.js && node --check src/zip-writer.js && node --check src/renderer/app.js && node --check src/renderer/preview-window.js && node --check src/renderer/manual-window.js && node --check src/renderer/advanced-window.js",
-    "test": "node --test test/api-raw-capture.test.js test/doubao-automation.test.js test/i18n.test.js test/image-pipeline.test.js test/original-overwrite.test.js test/task-retry.test.js test/worker-pool-policy.test.js test/qc-check.test.js test/theme-icon.test.js test/update-check.test.js test/url-candidates.test.js test/verification-retry.test.js test/verification-state.test.js test/zip-writer.test.js",
+    "check": "node --check src/main.js && node --check src/preload.js && node --check src/preview-preload.js && node --check src/manual-preload.js && node --check src/advanced-preload.js && node --check src/doubao-automation.js && node --check src/update-check.js && node --check src/qc-check.js && node --check src/theme-icon.js && node --check src/image-pipeline.js && node --check src/original-overwrite.js && node --check src/zip-writer.js && node --check src/renderer/app.js && node --check src/renderer/preview-window.js && node --check src/renderer/manual-window.js && node --check src/renderer/advanced-window.js",
+    "test": "node --test test/api-raw-capture.test.js test/doubao-automation.test.js test/i18n.test.js test/image-pipeline.test.js test/original-overwrite.test.js test/qc-check.test.js test/theme-icon.test.js test/update-check.test.js test/url-candidates.test.js test/verification-retry.test.js test/verification-state.test.js test/zip-writer.test.js",
     "postinstall": "node scripts/fix-electron-name.cjs",
     "dist": "electron-builder",
     "predist:ohos": "node scripts/prepare-ohos-libs.cjs",
