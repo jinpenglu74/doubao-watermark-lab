@@ -4,7 +4,6 @@ const crypto = require('node:crypto');
 const fs = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
-const { normalizeTaskError, workerDestroyedError } = require('./task-retry');
 
 const DOUBAO_CHAT_URL = 'https://www.doubao.com/chat/';
 const UPLOAD_MARKER = 'data-watermark-lab-upload';
@@ -16,11 +15,6 @@ const VERIFICATION_PATTERN = /请选择所有符合(?:上|下)文描述|拖拽�
 const VERIFICATION_SUCCESS_PATTERN = /验证(?:成功|通过|已完成)|已(?:完成|通过)验证|congratulations|verification (?:successful|succeeded|passed|complete)/i;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function settledNoImageGraceMs(noImageGraceMs, sawReplyFinished) {
-  const requested = Math.max(1_000, Number(noImageGraceMs) || DEFAULT_NO_IMAGE_GRACE_MS);
-  return sawReplyFinished ? Math.min(requested, 20_000) : requested;
-}
 
 function assertNotCancelled(isCancelled) {
   if (isCancelled?.()) {
@@ -57,18 +51,15 @@ async function waitFor(predicate, {
 }
 
 async function runInPage(webContents, fn, ...args) {
-  if (!webContents || webContents.isDestroyed?.()) throw workerDestroyedError();
   const source = `(${fn.toString()})(...${JSON.stringify(args)})`;
   let timer = null;
   try {
     return await Promise.race([
-      Promise.resolve().then(() => webContents.executeJavaScript(source, true)),
+      webContents.executeJavaScript(source, true),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('豆包页面响应超时，请刷新页面后重试')), 30_000);
       })
     ]);
-  } catch (error) {
-    throw normalizeTaskError(error);
   } finally {
     clearTimeout(timer);
   }
@@ -765,10 +756,8 @@ function sessionCaptureHub(session) {
 
 class DoubaoAutomation {
   constructor(browserWindow, options = {}) {
-    if (!browserWindow || browserWindow.isDestroyed?.()) throw workerDestroyedError();
     this.window = browserWindow;
     this.webContents = browserWindow.webContents;
-    if (!this.webContents || this.webContents.isDestroyed?.()) throw workerDestroyedError();
     this.session = this.webContents.session;
     this.isCancelled = options.isCancelled || (() => false);
     // 任一任务完成安全验证后，同批其他任务也会被风控波及：由调度方通过该回调通知整任务重启
@@ -776,15 +765,6 @@ class DoubaoAutomation {
     this.onProgress = options.onProgress || (() => {});
     this.onVerificationRequired = options.onVerificationRequired || null;
     this.onVerificationCleared = options.onVerificationCleared || null;
-    this.lastAuthenticatedAt = 0;
-    this.lastAuthenticatedStatus = null;
-  }
-
-  assertAlive() {
-    if (!this.window || this.window.isDestroyed?.()
-      || !this.webContents || this.webContents.isDestroyed?.()) {
-      throw workerDestroyedError();
-    }
   }
 
   async cookieLoginHint() {
@@ -798,7 +778,6 @@ class DoubaoAutomation {
   }
 
   async getLoginStatus() {
-    this.assertAlive();
     if (this.webContents.isLoading()) {
       await waitFor(() => !this.webContents.isLoading(), {
         timeout: 25_000,
@@ -837,19 +816,9 @@ class DoubaoAutomation {
     return { ...(last || classifyLoginState({}, false)), confirmed: false, checks: total };
   }
 
-  async requireAuthenticated({ force = false, maxAgeMs = 15_000 } = {}) {
-    if (!force && this.lastAuthenticatedStatus
-      && Date.now() - this.lastAuthenticatedAt <= maxAgeMs) {
-      return this.lastAuthenticatedStatus;
-    }
+  async requireAuthenticated() {
     const status = await this.confirmLoginStatus({ attempts: 3 });
-    if (status.state === 'authenticated') {
-      this.lastAuthenticatedAt = Date.now();
-      this.lastAuthenticatedStatus = status;
-      return status;
-    }
-    this.lastAuthenticatedAt = 0;
-    this.lastAuthenticatedStatus = null;
+    if (status.state === 'authenticated') return status;
     const error = new Error('豆包登录状态需要恢复');
     error.code = 'LOGIN_RECOVERY_REQUIRED';
     error.authStatus = status;
@@ -857,7 +826,6 @@ class DoubaoAutomation {
   }
 
   async waitForVerificationIfNeeded(maxWaitMs = 10 * 60_000) {
-    this.assertAlive();
     assertNotRestarted(this.shouldRestart);
     const first = await runInPage(this.webContents, pageVerificationState, VERIFICATION_PATTERN.source)
       .catch(() => ({ detected: false }));
@@ -922,7 +890,6 @@ class DoubaoAutomation {
   }
 
   async openLoginDialog() {
-    this.assertAlive();
     if (this.webContents.isLoading()) {
       await waitFor(() => !this.webContents.isLoading(), {
         timeout: 30_000,
@@ -958,7 +925,6 @@ class DoubaoAutomation {
   }
 
   async freshConversation() {
-    this.assertAlive();
     this.onProgress('正在创建新对话');
     const clicked = await runInPage(this.webContents, clickNewConversation).catch(() => false);
     if (clicked) {
@@ -967,11 +933,7 @@ class DoubaoAutomation {
       await sleep(800);
       return;
     }
-    try {
-      await this.window.loadURL(DOUBAO_CHAT_URL);
-    } catch (error) {
-      throw normalizeTaskError(error);
-    }
+    await this.window.loadURL(DOUBAO_CHAT_URL);
     await waitFor(() => !this.webContents.isLoading(), {
       timeout: 30_000,
       isCancelled: this.isCancelled,
@@ -981,15 +943,10 @@ class DoubaoAutomation {
   }
 
   async openConversation(conversationId) {
-    this.assertAlive();
     this.onProgress('正在打开该任务的历史对话');
     const currentUrl = await runInPage(this.webContents, () => location.href).catch(() => '');
     if (conversationIdFromUrl(currentUrl) === conversationId) return true;
-    try {
-      await this.window.loadURL(`${DOUBAO_CHAT_URL}${conversationId}`);
-    } catch (error) {
-      throw normalizeTaskError(error);
-    }
+    await this.window.loadURL(`${DOUBAO_CHAT_URL}${conversationId}`);
     await waitFor(() => !this.webContents.isLoading(), {
       timeout: 30_000,
       isCancelled: this.isCancelled,
@@ -1001,7 +958,6 @@ class DoubaoAutomation {
   }
 
   async attachFile(filePath) {
-    this.assertAlive();
     this.onProgress('正在上传原图');
     const debuggerApi = this.webContents.debugger;
     if (!debuggerApi.isAttached()) debuggerApi.attach('1.3');
@@ -1161,7 +1117,6 @@ class DoubaoAutomation {
   }
 
   async enterPrompt(prompt) {
-    this.assertAlive();
     this.onProgress('正在填写处理指令');
     const result = await waitFor(
       async () => {
@@ -1179,16 +1134,10 @@ class DoubaoAutomation {
   }
 
   async sendPrompt() {
-    this.assertAlive();
     const result = await runInPage(this.webContents, clickSendButton);
     if (result.clicked) return;
-    this.assertAlive();
-    try {
-      this.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ENTER' });
-      this.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ENTER' });
-    } catch (error) {
-      throw normalizeTaskError(error);
-    }
+    this.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'ENTER' });
+    this.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'ENTER' });
   }
 
   async waitForGeneratedImage(baselineUrls, networkCapture, timeoutMs = 240_000, {
@@ -1260,14 +1209,8 @@ class DoubaoAutomation {
 
       const stableFor = Date.now() - stableSince;
       const visibleFor = firstCandidateAt ? Date.now() - firstCandidateAt : 0;
-      // V1.9：生成已经结束、chat/completion 不再 pending 后，不再额外硬等 5~7 秒。
-      // api-raw 已到手时只需极短稳定期；普通 DOM/网络候选也只确认约 1 秒，随后立刻进入同会话复检。
-      const fastRawReady = apiRawCandidates.length > 0 && !apiPending;
-      const requiredStableMs = fastRawReady ? 450 : 900;
-      const requiredVisibleMs = fastRawReady ? 250 : 700;
-      if (totalCandidates && !snapshot.generating && !apiPending
-        && stableFor >= requiredStableMs && visibleFor >= requiredVisibleMs) {
-        this.onProgress('生成结果已就绪，立即进入残留复检');
+      // 有 chat/completion 仍在流式返回时不收兵：无水印原图（api-raw）在流结束时才落袋
+      if (totalCandidates && !snapshot.generating && !apiPending && stableFor > 6500 && visibleFor > 5500) {
         return [...apiRawCandidates, ...latestDomCandidates, ...generatedNetworkCandidates];
       }
 
@@ -1294,16 +1237,14 @@ class DoubaoAutomation {
         const replySettled = sawReplyFinished || ((sawGenerating || sawStreaming) && tailQuietMs > 4_000);
         if (replySettled && !generationDoneSince) {
           generationDoneSince = Date.now();
-          const settledGraceMs = settledNoImageGraceMs(noImageGraceMs, sawReplyFinished);
-          this.onProgress(`豆包回复已结束，继续等待图片出现（最长 ${Math.round(settledGraceMs / 1000)} 秒）`);
+          this.onProgress(`豆包回复已结束，继续等待图片出现（最长 ${Math.round(noImageGraceMs / 1000)} 秒）`);
         }
       }
 
-      const settledGraceMs = settledNoImageGraceMs(noImageGraceMs, sawReplyFinished);
-      if (!totalCandidates && !pendingImageCount && generationDoneSince && Date.now() - generationDoneSince > settledGraceMs) {
+      if (!totalCandidates && !pendingImageCount && generationDoneSince && Date.now() - generationDoneSince > noImageGraceMs) {
         throw noImageGeneratedError(snapshot.assistantTailText || snapshot.tailText, promptText);
       }
-      if (!totalCandidates && Date.now() - started > 10_000 && /抱歉|无法处理|不能完成|未能生成/.test(snapshot.tailText)) {
+      if (!totalCandidates && Date.now() - started > 35_000 && /抱歉|无法处理|不能完成|未能生成/.test(snapshot.tailText)) {
         const textOnlyError = new Error('豆包返回了文字提示，但没有生成图片；可调整提示词后重试');
         textOnlyError.code = 'NO_IMAGE_GENERATED';
         throw textOnlyError;
@@ -1311,7 +1252,7 @@ class DoubaoAutomation {
       if (!totalCandidates && idleSince && Date.now() - started > 90_000 && Date.now() - idleSince > 45_000) {
         throw noImageGeneratedError(snapshot.assistantTailText || snapshot.tailText, promptText);
       }
-      await sleep(450);
+      await sleep(1400);
     }
 
     const fallbackNetworkCandidates = [...networkCapture.candidates.values()].filter((candidate) =>
@@ -1324,26 +1265,19 @@ class DoubaoAutomation {
   }
 
   async processImage({ filePath, prompt, newConversation = true, conversationId = '', imageWaitSeconds = 0 }) {
-    this.assertAlive();
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
     // 登录检查放在任何会话导航之前：真实退出时不要先去点“新对话”然后报普通 DOM 错误，
     // 必须抛出 LOGIN_RECOVERY_REQUIRED 交给主调度自动恢复。
     await this.requireAuthenticated();
     let resumed = false;
-    let navigatedConversation = false;
     if (conversationId) {
       resumed = await this.openConversation(conversationId).catch(() => false);
-      navigatedConversation = resumed;
     }
-    // 历史对话接不上（已删除等）时也开新对话，避免内容发进无关会话。
-    // V2.0 复用固定 worker 当前聊天时 newConversation=false，此时没有发生导航，
-    // 直接复用刚刚确认过的登录状态，不再每张图额外做一次强制登录探测。
-    if (!resumed && (newConversation || conversationId)) {
-      await this.freshConversation();
-      navigatedConversation = true;
-    }
-    await this.requireAuthenticated({ force: navigatedConversation });
+    // 历史对话接不上（已删除等）时也开新对话，避免内容发进无关会话
+    if (!resumed && (newConversation || conversationId)) await this.freshConversation();
+    // 导航后再快速确认一次，覆盖“打开历史会话时刚好跳登录页”的边界情况。
+    await this.requireAuthenticated();
 
     await this.attachFile(filePath);
     // 上传完成后再填提示词：实测豆包在传图期间向输入框写入文字可能触发重渲染、冲掉未完成的附件
@@ -1359,9 +1293,13 @@ class DoubaoAutomation {
       await this.enterPrompt(prompt);
       await this.waitForVerificationIfNeeded();
       await this.sendPrompt();
-      // 会话 ID 不再挡在生成检测前面。先等图片，一旦生成完成就立刻进入后续流程；
-      // 此时 URL 通常早已带上会话 ID，再读取一次即可，省掉最多 3 秒前置等待。
+      // 新会话的 ID 要等首条消息发出后才出现在 URL 里，稍等片刻再读取
       let capturedConversationId = conversationId;
+      for (let attempt = 0; attempt < 6 && !capturedConversationId; attempt += 1) {
+        await sleep(500);
+        const url = await runInPage(this.webContents, () => location.href).catch(() => '');
+        capturedConversationId = conversationIdFromUrl(url);
+      }
       try {
         const candidates = await this.waitForGeneratedImage(baselineUrls, capture, undefined, {
           baselineFinishedReplies: Number(baseline.finishedReplies) || 0,
@@ -1371,18 +1309,9 @@ class DoubaoAutomation {
           noImageGraceMs: imageWaitSeconds > 0 ? imageWaitSeconds * 1000 : DEFAULT_NO_IMAGE_GRACE_MS,
           apiRawCapture
         });
-        if (!capturedConversationId) {
-          const url = await runInPage(this.webContents, () => location.href).catch(() => '');
-          capturedConversationId = conversationIdFromUrl(url);
-        }
         // apiRawHit 供调用方决定是否需要「加隔离带重发」的降级轮
         const apiRawHit = candidates.some((candidate) => candidate.source === 'api-raw');
-        return {
-          candidates,
-          conversationId: capturedConversationId,
-          apiRawHit,
-          generationReadyAt: Date.now()
-        };
+        return { candidates, conversationId: capturedConversationId, apiRawHit };
       } catch (error) {
         if (capturedConversationId && !error.conversationId) error.conversationId = capturedConversationId;
         throw error;
@@ -1393,64 +1322,12 @@ class DoubaoAutomation {
     }
   }
 
-  async inspectLatestGeneratedResidual({ prompt, timeoutMs = 45_000, skipAuthCheck = false, onDispatched = null }) {
-    this.assertAlive();
-    assertNotCancelled(this.isCancelled);
-    await this.waitForVerificationIfNeeded();
-    if (!skipAuthCheck) await this.requireAuthenticated();
-
-    this.onProgress('正在当前会话直接复检上一张生成图');
-    const baseline = await runInPage(this.webContents, pageImageSnapshot);
-    await this.enterPrompt(prompt);
-    await this.waitForVerificationIfNeeded();
-    await this.sendPrompt();
-    if (typeof onDispatched === 'function') {
-      try { onDispatched(Date.now()); } catch { /* timing callback must never break audit */ }
-    }
-
-    const started = Date.now();
-    let lastText = '';
-    let stableSince = Date.now();
-    let lastParsed = null;
-    while (Date.now() - started < timeoutMs) {
-      assertNotCancelled(this.isCancelled);
-      assertNotRestarted(this.shouldRestart);
-      await this.waitForVerificationIfNeeded();
-      const snapshot = await runInPage(this.webContents, pageImageSnapshot);
-      const text = String(snapshot.assistantTailText || '').trim();
-      if (text !== lastText) {
-        lastText = text;
-        stableSince = Date.now();
-        lastParsed = parseWatermarkAudit(text);
-      }
-      const finished = Number(snapshot.finishedReplies) > Number(baseline.finishedReplies || 0)
-        || Number(snapshot.followUps) > Number(baseline.followUps || 0);
-      const settled = !snapshot.generating && (finished || Date.now() - stableSince > 2200);
-      if (settled && lastParsed) {
-        return {
-          ...lastParsed,
-          auditMode: 'same-conversation'
-        };
-      }
-      if (settled && text && Date.now() - stableSince > 5000) {
-        const error = new Error('同会话残留复检返回格式异常');
-        error.code = 'SAME_CONVERSATION_AUDIT_FAILED';
-        throw error;
-      }
-      await sleep(700);
-    }
-    const error = new Error('同会话残留复检超时');
-    error.code = 'SAME_CONVERSATION_AUDIT_FAILED';
-    throw error;
-  }
-
   async inspectWatermarkResidual({ filePath, prompt, timeoutMs = 90_000 }) {
-    this.assertAlive();
     assertNotCancelled(this.isCancelled);
     await this.waitForVerificationIfNeeded();
     await this.requireAuthenticated();
     await this.freshConversation();
-    await this.requireAuthenticated({ force: true });
+    await this.requireAuthenticated();
 
     this.onProgress('正在全图复检残留水印');
     await this.attachFile(filePath);
@@ -1489,7 +1366,6 @@ class DoubaoAutomation {
   }
 
   async downloadGeneratedFromEditor(nativeImage, timeoutMs = 60_000) {
-    this.assertAlive();
     const temporaryPath = path.join(os.tmpdir(), `watermark-lab-${Date.now()}-${crypto.randomUUID()}.png`);
     let activeItem = null;
     let timer = null;
@@ -1552,7 +1428,6 @@ class DoubaoAutomation {
   }
 
   async captureLatestGeneratedCanvas(nativeImage, candidates = []) {
-    this.assertAlive();
     await this.waitForVerificationIfNeeded();
     this.onProgress('链接不可用，正在从豆包高清预览导出');
     const candidateUrls = candidates.map((candidate) => typeof candidate === 'string' ? candidate : candidate?.url).filter(Boolean);
@@ -1638,6 +1513,5 @@ module.exports = {
   parseWatermarkAudit,
   pageLoginStatus,
   pageVerificationState,
-  responseHeader,
-  settledNoImageGraceMs
+  responseHeader
 };
