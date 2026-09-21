@@ -1,0 +1,61 @@
+name: Build V1.5.0 Portable
+
+on:
+  push:
+    branches:
+      - build-v1.5.0-portable
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-x64-portable:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          if ($version -ne "1.5.0") { throw "Expected V1.5.0, got $version" }
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Build Windows x64 portable
+        shell: pwsh
+        run: npx electron-builder --win portable --x64 --publish never
+
+      - name: Verify portable EXE
+        id: verify
+        shell: pwsh
+        run: |
+          $portable = Get-ChildItem -Path dist -Filter "*-win-x64-portable.exe" | Select-Object -First 1
+          if (-not $portable) { throw "Windows x64 portable EXE was not generated" }
+          $hash = (Get-FileHash $portable.FullName -Algorithm SHA256).Hash.ToLower()
+          Write-Host "PORTABLE_PATH=$($portable.FullName)"
+          Write-Host "SHA256=$hash"
+
+      - name: Upload portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: doubao-watermark-lab-v1.5.0-win-x64-portable
+          path: dist/*-win-x64-portable.exe
+          if-no-files-found: error
+          retention-days: 30
