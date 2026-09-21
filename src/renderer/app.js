@@ -254,14 +254,14 @@ function progressForMessage(message, current = 0) {
   else if (/临时空白|添加.*空白/.test(text)) progress = 14;
   else if (/上传原图/.test(text)) progress = 24;
   else if (/填写处理指令/.test(text)) progress = 34;
-  else if (/工作窗口异常|重新创建豆包工作窗口|自动重跑|登录状态异常|恢复豆包登录|刷新豆包会话|重置豆包工作窗口|需要重新登录|登录会话已恢复|会话已自动恢复|登录状态正常/.test(text)) progress = Math.max(current, 10);
+  else if (/登录状态异常|恢复豆包登录|刷新豆包会话|重置豆包工作窗口|需要重新登录|登录会话已恢复|会话已自动恢复|登录状态正常/.test(text)) progress = Math.max(current, 10);
   else if (/安全验证/.test(text)) progress = Math.max(current, 42);
   else if (/重绘图片/.test(text)) progress = 56;
   else if (resourceMatch) progress = 68 + Math.round((Number(resourceMatch[1]) / Math.max(1, Number(resourceMatch[2]))) * 14);
   else if (/原生保存|下载/.test(text)) progress = 84;
   else if (/高清预览|高清画布|生成结果画布/.test(text)) progress = 90;
   else if (/自动定点补修/.test(text)) progress = Math.max(current, 92);
-  else if (/全图复检|同会话复检|当前会话直接复检|残留水印/.test(text)) progress = Math.max(current, 94);
+  else if (/全图复检|残留水印/.test(text)) progress = Math.max(current, 94);
   else if (/安全覆盖原图|覆盖原图/.test(text)) progress = Math.max(current, 97);
   return Math.min(96, Math.max(current, progress));
 }
@@ -392,24 +392,7 @@ function makeQueueItem(file, index) {
   meta.textContent = `${file.width} × ${file.height} · ${formatBytes(file.bytes)}`;
   copy.append(name, meta);
   // 采集来源小标记：直取原图（接口拦截，未加工）/ 降级裁切（加隔离带重发）/ 页面采集（无隔离带）
-  if (file.status === 'complete' && file.timings?.totalMs) {
-    const flag = document.createElement('span');
-    flag.className = 'capture-flag is-page';
-    flag.textContent = t('耗时 {n}秒', { n: (file.timings.totalMs / 1000).toFixed(1) });
-    flag.title = t(file.timingSummary || '');
-    copy.append(flag);
-  }
-    if (file.status === 'complete' && file.auditMode && file.auditMode !== 'manual-skip') {
-    const flag = document.createElement('span');
-    const usedFallback = file.auditMode === 'same-conversation-with-fallback';
-    flag.className = usedFallback ? 'qc-flag' : 'capture-flag is-raw';
-    flag.textContent = usedFallback ? t('复检：同会话→回退') : t('同会话复检');
-    flag.title = usedFallback
-      ? t('优先在当前会话复检；同会话失败后才重新上传结果图兜底')
-      : t('直接检查当前会话上一张生成图，未重新上传结果图');
-    copy.append(flag);
-  }
-    if (file.status === 'complete' && file.captureSource) {
+  if (file.status === 'complete' && file.captureSource) {
     const flag = document.createElement('span');
     const isRaw = file.captureSource === 'api-raw';
     const isFallback = !isRaw && file.removedUploadPadding === true;
@@ -654,11 +637,6 @@ function handleBatchEvent(event) {
         autoRepairPasses: event.autoRepairPasses || 0,
         residualAuditCount: event.residualAuditCount || 0,
         residualStatus: event.residualStatus || '',
-        sameConversationAuditCount: event.sameConversationAuditCount || 0,
-        auditFallbackCount: event.auditFallbackCount || 0,
-        auditMode: event.auditMode || '',
-        timings: event.timings || null,
-        timingSummary: event.timingSummary || '',
         overwroteOriginal: event.overwroteOriginal === true,
         overwriteStatus: event.overwriteStatus || '',
         ...(event.refreshedSource ? {
