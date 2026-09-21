@@ -1,0 +1,32 @@
+name: Package V1.5.0 Source
+
+on:
+  push:
+    branches:
+      - package-v1.5.0-source
+
+jobs:
+  package-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout V1.5.0 baseline
+        uses: actions/checkout@v4
+        with:
+          ref: 64f2b6eaabf1a41952e0d4fc5cf3fe98ba404a47
+          fetch-depth: 0
+
+      - name: Create source archive
+        shell: bash
+        run: |
+          git archive --format=zip \
+            --prefix=doubao-watermark-lab-v1.5.0/ \
+            -o doubao-watermark-lab-v1.5.0-source.zip \
+            64f2b6eaabf1a41952e0d4fc5cf3fe98ba404a47
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: doubao-watermark-lab-v1.5.0-source
+          path: doubao-watermark-lab-v1.5.0-source.zip
+          if-no-files-found: error
+          retention-days: 30
